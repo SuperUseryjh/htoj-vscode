@@ -1,0 +1,16 @@
+.vscode/**
+.github/**
+node_modules/**
+src/**
+test/**
+re/**
+docs/**
+esbuild.js
+tsconfig.json
+bunfig.toml
+bun.lock
+bun.lockb
+package-lock.json
+**/*.map
+.gitignore
+docs/

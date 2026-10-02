@@ -1,0 +1,350 @@
+{
+  "name": "htoj-vscode",
+  "displayName": "核桃 OJ",
+  "description": "在 VSCode 里刷核桃OJ：浏览题目/题单/比赛，本地写代码，一键提交并查看评测结果。",
+  "version": "1.0.0",
+  "publisher": "YaoOnion",
+  "license": "GPL-3.0-only",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "htoj",
+          "title": "核桃 OJ",
+          "icon": "resources/htoj.svg"
+        }
+      ]
+    },
+    "views": {
+      "htoj": [
+        {
+          "id": "htoj.problems",
+          "name": "题目",
+          "icon": "resources/htoj.svg"
+        },
+        {
+          "id": "htoj.trainings",
+          "name": "题单",
+          "icon": "resources/htoj.svg"
+        },
+        {
+          "id": "htoj.contests",
+          "name": "比赛",
+          "icon": "resources/htoj.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "htoj.problems",
+        "contents": "登录后即可浏览题目。\n[微信扫码登录](command:htoj.login)\n[粘贴 Token](command:htoj.loginWithToken)"
+      },
+      {
+        "view": "htoj.trainings",
+        "contents": "登录后即可浏览题单。\n[微信扫码登录](command:htoj.login)"
+      },
+      {
+        "view": "htoj.contests",
+        "contents": "登录后即可浏览比赛。\n[微信扫码登录](command:htoj.login)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "htoj.login",
+        "title": "登录（微信扫码）",
+        "category": "核桃OJ",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "htoj.loginByPassword",
+        "title": "登录（手机号 + 密码）",
+        "category": "核桃OJ"
+      },
+      {
+        "command": "htoj.loginWithToken",
+        "title": "登录（粘贴 Token）",
+        "category": "核桃OJ"
+      },
+      {
+        "command": "htoj.logout",
+        "title": "退出登录",
+        "category": "核桃OJ",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "htoj.switchZone",
+        "title": "切换题库语言（C++ / Python）",
+        "category": "核桃OJ",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "htoj.refresh",
+        "title": "刷新",
+        "category": "核桃OJ",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "htoj.searchProblem",
+        "title": "搜索题目",
+        "category": "核桃OJ",
+        "icon": "$(search)"
+      },
+      {
+        "command": "htoj.clearSearch",
+        "title": "清除题目搜索",
+        "category": "核桃OJ",
+        "icon": "$(close)"
+      },
+      {
+        "command": "htoj.openProblem",
+        "title": "打开题目详情",
+        "category": "核桃OJ"
+      },
+      {
+        "command": "htoj.openInBrowser",
+        "title": "在浏览器中打开",
+        "category": "核桃OJ"
+      },
+      {
+        "command": "htoj.openContestInBrowser",
+        "title": "在浏览器中打开比赛",
+        "category": "核桃OJ"
+      },
+      {
+        "command": "htoj.joinContest",
+        "title": "报名比赛",
+        "category": "核桃OJ",
+        "icon": "$(add)"
+      },
+      {
+        "command": "htoj.startContest",
+        "title": "开始比赛",
+        "category": "核桃OJ",
+        "icon": "$(play)"
+      },
+      {
+        "command": "htoj.joinTraining",
+        "title": "开始练习（参加题单）",
+        "category": "核桃OJ",
+        "icon": "$(play)"
+      },
+      {
+        "command": "htoj.selectCountdown",
+        "title": "选择倒计时比赛",
+        "category": "核桃OJ",
+        "icon": "$(watch)"
+      },
+      {
+        "command": "htoj.trackContestCountdown",
+        "title": "设为倒计时目标",
+        "category": "核桃OJ",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "htoj.showLogs",
+        "title": "查看日志",
+        "category": "核桃OJ",
+        "icon": "$(output)"
+      },
+      {
+        "command": "htoj.menu",
+        "title": "打开菜单",
+        "category": "核桃OJ",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "htoj.newCodeFile",
+        "title": "新建/打开本地代码文件",
+        "category": "核桃OJ",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "htoj.submit",
+        "title": "提交当前文件",
+        "category": "核桃OJ",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "htoj.showMySubmissions",
+        "title": "查看本题提交记录",
+        "category": "核桃OJ",
+        "icon": "$(history)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "htoj.searchProblem",
+          "when": "view == htoj.problems",
+          "group": "navigation@1"
+        },
+        {
+          "command": "htoj.clearSearch",
+          "when": "view == htoj.problems && htoj.hasSearch",
+          "group": "navigation@2"
+        },
+        {
+          "command": "htoj.refresh",
+          "when": "view =~ /htoj\\.(problems|trainings|contests)/",
+          "group": "navigation@3"
+        },
+        {
+          "command": "htoj.switchZone",
+          "when": "view =~ /htoj\\.(problems|trainings|contests)/",
+          "group": "navigation@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "htoj.openContestInBrowser",
+          "when": "view == htoj.contests && viewItem =~ /htoj\\.contest/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "htoj.joinContest",
+          "when": "view == htoj.contests && viewItem == htoj.contestDetail.unregistered",
+          "group": "1_open@2"
+        },
+        {
+          "command": "htoj.startContest",
+          "when": "view == htoj.contests && viewItem == htoj.contestDetail.needstart",
+          "group": "1_open@3"
+        },
+        {
+          "command": "htoj.trackContestCountdown",
+          "when": "view == htoj.contests && viewItem =~ /htoj\\.contest/",
+          "group": "2_track@1"
+        },
+        {
+          "command": "htoj.joinTraining",
+          "when": "view == htoj.trainings && viewItem == htoj.training.unattended",
+          "group": "inline@0"
+        },
+        {
+          "command": "htoj.newCodeFile",
+          "when": "view =~ /htoj\\.(problems|trainings|contests)/ && viewItem == htoj.problem",
+          "group": "inline@1"
+        },
+        {
+          "command": "htoj.openInBrowser",
+          "when": "view =~ /htoj\\.(problems|trainings|contests)/ && viewItem == htoj.problem",
+          "group": "inline@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "htoj.clearSearch",
+          "when": "htoj.hasSearch"
+        },
+        {
+          "command": "htoj.joinContest",
+          "when": "false"
+        },
+        {
+          "command": "htoj.startContest",
+          "when": "false"
+        },
+        {
+          "command": "htoj.joinTraining",
+          "when": "false"
+        },
+        {
+          "command": "htoj.openContestInBrowser",
+          "when": "false"
+        },
+        {
+          "command": "htoj.trackContestCountdown",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "htoj.submit",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "editorTextFocus && htoj.isHtojFile"
+      }
+    ],
+    "configuration": {
+      "title": "核桃 OJ",
+      "properties": {
+        "htoj.zone": {
+          "type": "string",
+          "enum": [
+            "cpp",
+            "python"
+          ],
+          "enumDescriptions": [
+            "C++ 题库（对应站点 /cpp/）",
+            "Python 题库（对应站点 /py/）"
+          ],
+          "default": "cpp",
+          "description": "当前使用的题库语言分区。"
+        },
+        "htoj.apiBase": {
+          "type": "string",
+          "default": "https://api.htoj.com.cn",
+          "description": "接口网关地址。"
+        },
+        "htoj.pageSize": {
+          "type": "number",
+          "default": 20,
+          "minimum": 5,
+          "maximum": 100,
+          "description": "每个列表视图每页加载的条数。注意服务端对每页条数有上限（实测 get-problem-list 为 20），超出会被截断。"
+        },
+        "htoj.defaultLanguage": {
+          "type": "string",
+          "default": "C++17 With O2",
+          "enum": [
+            "C++14 With O2",
+            "C++17 With O2",
+            "Python3"
+          ],
+          "description": "提交代码时使用的语言。"
+        },
+        "htoj.codeDirectory": {
+          "type": "string",
+          "default": "htoj",
+          "description": "本地代码文件存放目录（相对于工作区根目录）。"
+        },
+        "htoj.pollIntervalMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 500,
+          "description": "评测结果轮询间隔（毫秒）。"
+        },
+        "htoj.pollTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 5000,
+          "description": "评测结果轮询超时时间（毫秒）。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "bun esbuild.js",
+    "watch": "bun esbuild.js --watch",
+    "check": "bunx tsc --noEmit",
+    "test": "bun test",
+    "package": "bun esbuild.js --production",
+    "vscode:prepublish": "bun esbuild.js --production"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.4.5"
+  }
+}

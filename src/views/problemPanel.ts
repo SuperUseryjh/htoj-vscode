@@ -1,0 +1,875 @@
+import * as vscode from "vscode";
+import { problem as problemApi } from "../api/endpoints";
+import type {
+  JudgeStatus,
+  ProblemContext,
+  ProblemDetail,
+  SubmissionAnswer,
+  SubmissionDetail,
+  SubmissionRecord,
+} from "../api/types";
+import type { Session } from "../session";
+import { log } from "../util/logger";
+import { statusIcon } from "./common";
+
+export interface ProblemPanelDeps {
+  session: Session;
+  /** 新建 / 打开本地代码文件 */
+  onOpenCodeFile(pid: number, problemId: string, context?: ProblemContext): Promise<void>;
+  /** 提交当前代码（OJ 编程题） */
+  onSubmit(pid: number, context?: ProblemContext): Promise<void>;
+  /** 提交答案（选择题 / 客观题） */
+  onSubmitAnswers(
+    pid: number,
+    context: ProblemContext | undefined,
+    payload: { kind: "choice" | "objective"; code?: string; answers?: Record<string, string> },
+  ): Promise<void>;
+  /** 在浏览器中打开题目 */
+  onOpenInBrowser(pid: number, context?: ProblemContext): void;
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** 用 VSCode 内置 markdown 渲染器把 Markdown 转成 HTML */
+async function renderMarkdown(markdown: string): Promise<string> {
+  try {
+    const extension = vscode.extensions.getExtension("vscode.markdown-language-features");
+    if (extension && !extension.isActive) {
+      await extension.activate();
+    }
+    const html = await vscode.commands.executeCommand<string>("markdown.api.render", markdown);
+    if (typeof html === "string" && html.length > 0) {
+      return html;
+    }
+  } catch {
+    // 内置渲染器不可用时退化为纯文本
+  }
+  return `<pre class="raw">${escapeHtml(markdown)}</pre>`;
+}
+
+interface KatexStyle {
+  /** 扩展根目录，需要加进 webview 的 localResourceRoots */
+  root: vscode.Uri;
+  /** katex.min.css 的路径 */
+  file: vscode.Uri;
+}
+
+/**
+ * 找到内置 markdown-math 扩展提供的 KaTeX 样式表。
+ *
+ * KaTeX 对每个公式会输出两份内容：`.katex-mathml`（供读屏器）和 `.katex-html`（视觉版），
+ * 前者靠 katex.min.css 里的 clip 规则隐藏。VSCode 的 markdown 预览会自动注入这份 CSS，
+ * 但 webview 不会——不注入就会看到「原文 + 渲染结果」重复显示。
+ */
+function findKatexStyle(): KatexStyle | undefined {
+  const extension = vscode.extensions.getExtension("vscode.markdown-math");
+  const styles: unknown = extension?.packageJSON?.contributes?.["markdown.previewStyles"];
+  if (!extension || !Array.isArray(styles)) {
+    return undefined;
+  }
+  const relative = styles.find(
+    (item): item is string => typeof item === "string" && item.includes("katex"),
+  );
+  if (!relative) {
+    return undefined;
+  }
+  return {
+    root: extension.extensionUri,
+    file: vscode.Uri.joinPath(extension.extensionUri, relative.replace(/^\.\//, "")),
+  };
+}
+
+/**
+ * 评测状态 → 短标签（AC / WA / TLE…）。
+ * 后端的 shortName 经常是 null，所以按 id 兜底。
+ */
+const STATUS_TAGS: Record<number, string> = {
+  0: "AC",
+  1: "PE",
+  2: "TLE",
+  3: "MLE",
+  4: "WA",
+  5: "RE",
+  6: "OLE",
+  7: "CE",
+  8: "SE",
+  [-10]: "Judging",
+  99: "等待中",
+};
+
+function statusTag(status?: JudgeStatus | null): string {
+  return status?.shortName || STATUS_TAGS[status?.id ?? -1] || status?.name || "未知";
+}
+
+/** 折叠状态下也要能一眼看出「什么时候、多少分、什么结果」 */
+function renderSubmissionItem(
+  record: SubmissionRecord,
+  detail: SubmissionDetail | undefined,
+  open: boolean,
+): string {
+  const { color } = statusIcon(record.status?.id ?? -1);
+  const meta = [record.language, record.time === null ? undefined : `${record.time}ms`, record.memory === null ? undefined : `${record.memory}KB`]
+    .filter(Boolean)
+    .join(" · ");
+  return `<details class="sub" data-submit-id="${record.submitId}"${open ? " open" : ""}>
+  <summary>
+    <span class="sub-tag" style="color:${color}">${escapeHtml(statusTag(record.status))}</span>
+    <span class="sub-score">${record.score === null ? "-" : `${record.score} 分`}</span>
+    <span class="sub-time">${escapeHtml(new Date(record.submitTime).toLocaleString())}</span>
+    <span class="sub-meta">${escapeHtml(meta)}</span>
+  </summary>
+  <div class="sub-body" data-pending="${detail ? "0" : "1"}">${
+    detail ? renderSubmissionResult(detail) : `<p class="muted">展开后加载评测详情…</p>`
+  }</div>
+</details>`;
+}
+
+/** 提交结果 → HTML 片段 */
+export function renderSubmissionResult(detail: SubmissionDetail): string {
+  const rows: string[] = [];
+  const groups = detail.caseGroups ?? [];
+  for (const group of groups) {
+    for (const item of group.caseResult ?? []) {
+      const status = item.status ?? { id: -1, name: "未知" };
+      const { color } = statusIcon(status.id);
+      rows.push(
+        `<tr>
+           <td>#${item.seq}</td>
+           <td><span style="color:${color}">${escapeHtml(status.name ?? "未知")}</span></td>
+           <td>${item.score ?? "-"}</td>
+           <td>${item.time ?? "-"}</td>
+           <td>${item.memory ?? "-"}</td>
+         </tr>`,
+      );
+    }
+  }
+
+  // 选择题没有测试点，只有提交时选的选项
+  const cases =
+    rows.length > 0
+      ? `<table class="cases">
+           <thead><tr><th>测试点</th><th>状态</th><th>分数</th><th>用时(ms)</th><th>内存(KB)</th></tr></thead>
+           <tbody>${rows.join("")}</tbody>
+         </table>`
+      : detail.language === "choice" && detail.userCode
+        ? `<p class="muted">我的选择：${escapeHtml(detail.userCode)}</p>`
+        : `<p class="muted">没有测试点明细。</p>`;
+
+  const accepted = detail.resultCode === 1;
+  const summary = accepted
+    ? `<p class="ok">评测通过${detail.score === null ? "" : `，得分 <b>${detail.score}</b>`}</p>`
+    : detail.resultCode === 0
+      ? `<p class="muted">评测中…</p>`
+      : `<p class="bad">${escapeHtml(detail.status?.name ?? "评测未通过")}${
+          detail.score === null ? "" : `，得分 <b>${detail.score}</b>`
+        }</p>`;
+
+  return `
+    ${summary}
+    <p class="muted">提交号 ${detail.submitId}${detail.language ? ` · ${escapeHtml(detail.language)}` : ""}</p>
+    ${answerTable(detail.answers) ?? cases}
+  `;
+}
+
+/** 客观题逐题批改结果（-1 未作答 1 正确 2 错误 3 已作答） */
+const ANSWER_STATUS_TEXT: Record<number, { text: string; color: string }> = {
+  [-1]: { text: "未作答", color: "var(--vscode-descriptionForeground)" },
+  1: { text: "正确", color: "#00B42A" },
+  2: { text: "错误", color: "#FF1D27" },
+  3: { text: "已作答", color: "#6850ff" },
+};
+
+function answerTable(answers: SubmissionAnswer[] | null | undefined): string | undefined {
+  if (!answers?.length) {
+    return undefined;
+  }
+  const rows = answers.map((item) => {
+    const status = ANSWER_STATUS_TEXT[item.status] ?? ANSWER_STATUS_TEXT[-1];
+    return `<tr>
+      <td>#${escapeHtml(item.id)}</td>
+      <td>${escapeHtml(item.myAnswer ?? "-")}</td>
+      <td>${item.answer ? escapeHtml(item.answer) : "-"}</td>
+      <td><span style="color:${status.color}">${status.text}</span></td>
+      <td>${item.myScore === null || item.myScore < 0 ? "-" : item.myScore}${
+        item.score === null ? "" : ` / ${item.score}`
+      }</td>
+    </tr>`;
+  });
+  return `<table class="cases">
+    <thead><tr><th>小题</th><th>我的答案</th><th>正确答案</th><th>状态</th><th>得分</th></tr></thead>
+    <tbody>${rows.join("")}</tbody>
+  </table>`;
+}
+
+/**
+ * 题目大类。接口的 `problemBaseVO.type`：1=OJ 编程题 2=选择题 5=客观题。
+ * 选择题和客观题都是「提交答案」而不是提交代码，面板要换一套交互。
+ */
+type ProblemKind = "oj" | "choice" | "objective";
+
+function problemKind(problem: ProblemDetail): ProblemKind {
+  switch (problem.problemBaseVO.type) {
+    case 2:
+      return "choice";
+    case 5:
+      return "objective";
+    default:
+      return "oj";
+  }
+}
+
+interface BuildHtmlOptions {
+  bodyHtml: string;
+  accepted: boolean;
+  contextHint?: string;
+  /** 题目大类，决定工具栏和作答区 */
+  kind: ProblemKind;
+  /** 提交记录列表的 HTML（折叠项） */
+  submissionsHtml: string;
+  /** KaTeX 样式表的 webview URI，取不到时不注入 */
+  katexUri?: string;
+  /** webview 的资源源，CSP 里需要放行 */
+  cspSource: string;
+}
+
+function buildHtml(problem: ProblemDetail, options: BuildHtmlOptions): string {
+  const { bodyHtml, accepted, contextHint, kind, submissionsHtml, katexUri, cspSource } = options;
+  const interactive = kind !== "oj";
+  const base = problem.problemBaseVO;
+  const oj = problem.problemOjDetailVO;
+  const nonce = `${Date.now()}${Math.random()}`.replace(/\W/g, "");
+  const tags = (base.tags ?? []).map((tag) => `<span class="tag">${escapeHtml(tag.name)}</span>`).join("");
+  const meta = [
+    base.difficulty ? `<span class="tag diff">${escapeHtml(base.difficulty.name)}</span>` : "",
+    tags,
+  ]
+    .filter(Boolean)
+    .join("");
+  const limits = oj
+    ? `时间 ${oj.timeLimit}ms · 内存 ${oj.memoryLimit}MB · ${escapeHtml(oj.ioMode?.name ?? "")}`
+    : "";
+  const rate = base.total > 0 ? `${((base.ac / base.total) * 100).toFixed(1)}%` : "-";
+  const kindLabel = kind === "choice" ? "选择题" : kind === "objective" ? "客观题" : "";
+  // 选择题/客观题没有时空限制，那一行就换成题目类型
+  const infoLine = [kindLabel || limits, `通过率 ${rate}（${base.ac}/${base.total}）`]
+    .filter(Boolean)
+    .join(" · ");
+  // 选择题的选项直接由接口下发；客观题的选项藏在题面 markdown 里，交给脚本按占位符生成
+  const choice = problem.problemChoiceDetailVO;
+  const multi = choice?.choiceType === 4;
+  const choicesHtml =
+    kind === "choice" && choice
+      ? `<div class="choices"${multi ? ` data-multi="1"` : ""}>${(choice.options ?? [])
+          .map(
+            (option, index) => `<label class="choice-option">
+  <input type="${multi ? "checkbox" : "radio"}" name="choice" value="${escapeHtml(option.id)}" class="choice-input" />
+  <span class="choice-letter">${String.fromCharCode(65 + index)}.</span>
+  <span class="choice-body">${escapeHtml(option.label)}
+    ${option.picUrl ? `<img src="${escapeHtml(option.picUrl)}" alt="" />` : ""}
+  </span>
+</label>`,
+          )
+          .join("")}</div>`
+      : "";
+  // 文件 IO 题必须让用户知道程序该读写哪个文件。
+  // 注意不能只看文件名：标准 IO 题的 ioReadFileName 也有值（默认 case.in），要靠 ioMode 区分。
+  const ioFiles =
+    oj && oj.ioMode?.id === 2 && (oj.ioReadFileName || oj.ioWriteFileName)
+      ? `<div class="meta fileio">文件 IO：读 <code>${escapeHtml(oj.ioReadFileName ?? "-")}</code> · 写 <code>${escapeHtml(oj.ioWriteFileName ?? "-")}</code></div>`
+      : "";
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src https: data:; style-src 'unsafe-inline' ${cspSource}; font-src ${cspSource} https: data:; script-src 'nonce-${nonce}';" />
+${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
+<style>
+  /* KaTeX 为了无障碍会输出一份 .katex-mathml，靠 katex.min.css 的 clip 规则隐藏。
+     katex.min.css 没加载成功时这里兜底，否则会看到「原文 + 渲染结果」重复两遍。 */
+  .katex-mathml {
+    position: absolute;
+    clip: rect(1px, 1px, 1px, 1px);
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+  }
+  body {
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    padding: 0 20px 40px;
+    line-height: 1.7;
+    word-break: break-word;
+  }
+  header { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 12px 0 10px; border-bottom: 1px solid var(--vscode-panel-border); z-index: 2; }
+  h1 { font-size: 1.4em; margin: 0 0 6px; }
+  .meta { color: var(--vscode-descriptionForeground); font-size: 0.92em; }
+  .tag { display: inline-block; padding: 0 6px; margin: 0 6px 4px 0; border-radius: 4px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-size: 0.85em; }
+  .tag.diff { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .tag.ctx { background: var(--vscode-inputValidation-infoBorder, #007acc); color: #fff; }
+  .toolbar { margin: 10px 0 4px; display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font-family: inherit; font-size: inherit; cursor: pointer;
+    padding: 4px 12px; border: none; border-radius: 4px;
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #ccc);
+  }
+  button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  section { margin-top: 20px; }
+  section h2 { font-size: 1.05em; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; }
+  pre, code { font-family: var(--vscode-editor-font-family, monospace); }
+  pre { background: var(--vscode-textCodeBlock-background); padding: 10px; border-radius: 4px; overflow-x: auto; }
+  pre.raw { white-space: pre-wrap; }
+  table.cases { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  table.cases th, table.cases td { border: 1px solid var(--vscode-panel-border); padding: 3px 8px; text-align: left; }
+  table.cases th { background: var(--vscode-editorWidget-background); }
+  .ok { color: #00B42A; font-weight: 600; }
+  .bad { color: #FF1D27; font-weight: 600; }
+  .muted { color: var(--vscode-descriptionForeground); }
+  .accepted { color: #00B42A; }
+  /* 文件 IO 的文件名要一眼看到，写错就整题 0 分 */
+  .fileio { margin-top: 4px; font-weight: 600; color: var(--vscode-textLink-foreground); }
+  /* 提交记录：默认只露「状态 / 得分 / 时间」一行，展开才看测试点 */
+  details.sub {
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 4px;
+    margin: 6px 0;
+    background: var(--vscode-editorWidget-background);
+  }
+  details.sub > summary {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 0.95em;
+    user-select: none;
+  }
+  /* summary 用了 flex，默认的三角会被浏览器去掉，这里自己画一个 */
+  details.sub > summary::before {
+    content: "▸";
+    color: var(--vscode-descriptionForeground);
+  }
+  details.sub[open] > summary::before { content: "▾"; }
+  .sub-tag { font-weight: 700; min-width: 4.5em; }
+  .sub-score { min-width: 4em; }
+  .sub-time { color: var(--vscode-descriptionForeground); }
+  .sub-meta { margin-left: auto; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
+  .sub-body { padding: 0 10px 8px; }
+  .sub-body > p:first-child { margin-top: 0; }
+  /* 选择题选项 */
+  .choices { margin-top: 8px; }
+  .choice-option {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .choice-option:hover { background: var(--vscode-list-hoverBackground); }
+  .choice-letter { font-weight: 600; }
+  .choice-body img { display: block; margin-top: 6px; max-width: 100%; max-height: 160px; }
+  /* 客观题：占位符被替换成的作答控件 */
+  .objective-input {
+    font-family: inherit;
+    font-size: inherit;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    border-radius: 3px;
+    padding: 2px 6px;
+    min-width: 12em;
+  }
+  textarea.objective-input { width: 100%; min-height: 4em; vertical-align: top; }
+  .choices .objective-input { min-width: 0; }
+  .objective-option { display: flex; gap: 8px; align-items: flex-start; padding: 2px 0; cursor: pointer; }
+  #description label.objective-option { margin-left: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>${escapeHtml(base.problemId)} ${escapeHtml(base.title)} ${accepted ? '<span class="accepted">✓ 已通过</span>' : ""}</h1>
+  ${contextHint ? `<div class="meta"><span class="tag ctx">${escapeHtml(contextHint)}</span></div>` : ""}
+  <div class="meta">${meta}</div>
+  <div class="meta">${infoLine}</div>
+  ${ioFiles}
+  <div class="toolbar">
+    ${
+      interactive
+        ? `<button data-action="submitAnswers" class="primary">提交答案</button>`
+        : `<button data-action="code" class="primary">新建/打开代码文件</button>
+    <button data-action="submit" class="primary">提交当前文件</button>`
+    }
+    <button data-action="refresh">刷新</button>
+    <button data-action="browser">在浏览器中打开</button>
+  </div>
+</header>
+<section>
+  <h2>题目描述</h2>
+  <div id="description">${bodyHtml}</div>
+  ${choicesHtml}
+</section>
+<section id="submissions-section">
+  <h2>提交记录</h2>
+  <div id="submissions">${submissionsHtml}</div>
+</section>
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  const KIND = "${kind}";
+
+  /**
+   * 客观题的题面里用 【{{ select(1) }}】【{{ multiselect(2) }}】【{{ input(3) }}】【{{ textarea(4) }}】
+   * 这类占位符出题，选项就是紧跟其后的一串列表项。这里把占位符换成真正的作答控件。
+   * 单选/多选的选项值取 A、B、C…（与前端 use-mdown-transform 一致）。
+   */
+  const PLACEHOLDER = /\{\{\s*(input|select|multiselect|textarea)\(\s*(\d+(?:-\d+)?)\s*\)\s*\}\}/g;
+  const nextList = (el) => {
+    let node = el.nextElementSibling;
+    while (node && node.tagName !== "UL" && !(node.textContent || "").trim()) {
+      node = node.nextElementSibling;
+    }
+    return node && node.tagName === "UL" ? node : null;
+  };
+  const fillObjective = (root) => {
+    if (!root) return;
+    for (const block of Array.from(root.children)) {
+      if (block.tagName === "PRE") continue; // 代码块里的占位符是示例，不动
+      PLACEHOLDER.lastIndex = 0;
+      for (const match of [...block.innerHTML.matchAll(PLACEHOLDER)]) {
+        const [raw, type, id] = match;
+        if (type === "input" || type === "textarea") {
+          const tag =
+            type === "input"
+              ? '<input autocomplete="off" type="text" name="' + id + '" class="objective-input" />'
+              : '<textarea autocomplete="off" name="' + id + '" class="objective-input"></textarea>';
+          block.innerHTML = block.innerHTML.replace(raw, '<span id="p' + id + '">' + tag + "</span>");
+          continue;
+        }
+        // 单选 / 多选：选项来自紧随其后的列表
+        const list = nextList(block) || (block.parentElement ? nextList(block.parentElement) : null);
+        if (!list) continue;
+        block.innerHTML = block.innerHTML.replace(raw, "");
+        Array.from(list.querySelectorAll("li")).forEach((li, index) => {
+          const label = document.createElement("label");
+          label.className = "objective-option";
+          label.id = "p" + id;
+          const input = document.createElement("input");
+          input.type = type === "select" ? "radio" : "checkbox";
+          input.name = id;
+          input.className = "objective-input";
+          input.value = String.fromCharCode(65 + index);
+          const body = document.createElement("span");
+          body.innerHTML = li.innerHTML;
+          label.append(input, body);
+          li.replaceWith(label);
+        });
+      }
+    }
+  };
+  if (KIND === "objective") fillObjective(document.getElementById("description"));
+
+  /** 收集当前作答：客观题按小题号、选择题按选项 id */
+  const readAnswers = () => {
+    const answers = {};
+    const box = document.getElementById("description");
+    if (box) {
+      const byName = new Map();
+      box.querySelectorAll("input.objective-input, textarea.objective-input").forEach((el) => {
+        if (!byName.has(el.name)) byName.set(el.name, []);
+        byName.get(el.name).push(el);
+      });
+      for (const [name, list] of byName) {
+        if (list[0].type === "checkbox") {
+          const picked = list.filter((el) => el.checked).map((el) => el.value).sort();
+          if (picked.length) answers[name] = picked.join(",");
+        } else if (list[0].type === "radio") {
+          const picked = list.find((el) => el.checked);
+          if (picked) answers[name] = picked.value;
+        } else {
+          const value = list[0].value.trim();
+          if (value) answers[name] = value;
+        }
+      }
+    }
+    const code = Array.from(document.querySelectorAll(".choice-input:checked"))
+      .map((el) => el.value)
+      .join(",");
+    return { answers, code };
+  };
+
+  document.querySelectorAll("button[data-action]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const message = { type: "action", action: btn.dataset.action };
+      if (btn.dataset.action === "submitAnswers") Object.assign(message, readAnswers());
+      vscode.postMessage(message);
+    });
+  });
+
+  // 折叠项展开时才去拉评测详情，避免一打开面板就发一堆请求
+  const requestDetail = (item) => {
+    const body = item.querySelector(".sub-body");
+    if (!body || body.dataset.pending !== "1") return;
+    body.dataset.pending = "0";
+    body.innerHTML = '<p class="muted">加载评测详情…</p>';
+    vscode.postMessage({ type: "submissionDetail", submitId: Number(item.dataset.submitId) });
+  };
+  const bindSubmissions = (root) => {
+    root.querySelectorAll("details.sub").forEach((item) => {
+      item.addEventListener("toggle", () => {
+        if (item.open) requestDetail(item);
+      });
+      if (item.open) requestDetail(item);
+    });
+  };
+  bindSubmissions(document);
+
+  window.addEventListener("message", (event) => {
+    const message = event.data;
+    if (message.type === "submissions") {
+      const box = document.getElementById("submissions");
+      box.innerHTML = message.html;
+      bindSubmissions(box);
+    } else if (message.type === "submissionDetail") {
+      const item = document.querySelector('details.sub[data-submit-id="' + message.submitId + '"]');
+      const body = item && item.querySelector(".sub-body");
+      if (body) {
+        body.dataset.pending = "0";
+        body.innerHTML = message.html;
+      }
+    } else if (message.type === "scroll") {
+      const target = document.querySelector(message.selector);
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else if (message.type === "busy") {
+      document.querySelectorAll("button").forEach((btn) => (btn.disabled = message.value));
+    }
+  });
+</script>
+</body>
+</html>`;
+}
+
+/** 题目详情面板 */
+export class ProblemPanel implements vscode.Disposable {
+  private static current: ProblemPanel | undefined;
+
+  private readonly panel: vscode.WebviewPanel;
+  private readonly disposables: vscode.Disposable[] = [];
+  private pid: number;
+  private context: ProblemContext | undefined;
+  private problem: ProblemDetail | undefined;
+  /** 本题的提交记录（按时间倒序，接口就是这个顺序） */
+  private submissions: SubmissionRecord[] = [];
+  /** 已拉取过的评测详情，展开折叠项时直接用缓存 */
+  private readonly details = new Map<number, SubmissionDetail>();
+  /** 当前默认展开的那条；未设置时展开最新一条 */
+  private expandedSubmitId: number | undefined;
+  /** KaTeX 样式表的 webview URI（取不到则为 undefined） */
+  private readonly katexUri: string | undefined;
+
+  private constructor(
+    panel: vscode.WebviewPanel,
+    private readonly deps: ProblemPanelDeps,
+    pid: number,
+    context: ProblemContext | undefined,
+    katexFile: vscode.Uri | undefined,
+  ) {
+    this.panel = panel;
+    this.pid = pid;
+    this.context = context;
+    this.katexUri = katexFile ? panel.webview.asWebviewUri(katexFile).toString() : undefined;
+    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    this.panel.webview.onDidReceiveMessage(
+      (message: { type: string; action?: string; submitId?: number }) =>
+        void this.handleMessage(message),
+      null,
+      this.disposables,
+    );
+  }
+
+  static async show(
+    deps: ProblemPanelDeps,
+    pid: number,
+    context?: ProblemContext,
+  ): Promise<ProblemPanel> {
+    if (ProblemPanel.current) {
+      if (ProblemPanel.current.pid !== pid) {
+        // 换题目了，提交记录缓存一并清掉
+        ProblemPanel.current.submissions = [];
+        ProblemPanel.current.details.clear();
+        ProblemPanel.current.expandedSubmitId = undefined;
+      }
+      ProblemPanel.current.pid = pid;
+      ProblemPanel.current.context = context;
+      ProblemPanel.current.panel.reveal(vscode.ViewColumn.Active, false);
+      await ProblemPanel.current.load();
+      return ProblemPanel.current;
+    }
+
+    // 公式的样式表来自内置 markdown-math 扩展，需要把它的目录加进可访问资源
+    const katex = findKatexStyle();
+    const panel = vscode.window.createWebviewPanel(
+      "htoj.problem",
+      "题目",
+      vscode.ViewColumn.Active,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: katex ? [katex.root] : [],
+      },
+    );
+    const instance = new ProblemPanel(panel, deps, pid, context, katex?.file);
+    ProblemPanel.current = instance;
+    await instance.load();
+    return instance;
+  }
+
+  static get active(): ProblemPanel | undefined {
+    return ProblemPanel.current;
+  }
+
+  get currentPid(): number {
+    return this.pid;
+  }
+
+  get currentProblem(): ProblemDetail | undefined {
+    return this.problem;
+  }
+
+  get currentContext(): ProblemContext | undefined {
+    return this.context;
+  }
+
+  /** 重新加载题目并渲染 */
+  async load(): Promise<void> {
+    this.panel.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:20px">
+      <p>正在加载题目…</p></body></html>`;
+    try {
+      // 比赛题目必须带 cid，否则后端返回「该题目不可见」
+      log(
+        `[面板] 加载题目 pid=${this.pid}`,
+        this.context && Object.keys(this.context).length ? `上下文=${JSON.stringify(this.context)}` : "无上下文",
+      );
+      const [detail] = await Promise.all([
+        problemApi.detail(this.deps.session.client, this.pid, this.context),
+        this.fetchSubmissions(),
+      ]);
+      this.problem = detail;
+      await this.render();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log("[面板] 题目加载失败：", message);
+      this.panel.webview.html = `<!DOCTYPE html><html><body style="font-family:var(--vscode-font-family);padding:20px">
+        <h3>题目加载失败</h3><p>${escapeHtml(message)}</p></body></html>`;
+    }
+  }
+
+  /**
+   * 提交完成后刷新提交记录：刚拿到的评测详情直接进缓存，省一次请求，
+   * 列表刷新后最新一条默认展开，正好就是这条。
+   */
+  async showResult(detail: SubmissionDetail): Promise<void> {
+    this.details.set(detail.submitId, detail);
+    this.expandedSubmitId = detail.submitId;
+    await this.fetchSubmissions();
+    await this.post({ type: "submissions", html: this.renderSubmissionList() });
+    await this.post({ type: "scroll", selector: "#submissions-section" });
+  }
+
+  /** 把面板滚到提交记录（「查看本题提交记录」命令用） */
+  focusSubmissions(): void {
+    void this.post({ type: "scroll", selector: "#submissions-section" });
+  }
+
+  /** webview 刚设置完 html 时可能还没就绪，postMessage 会返回 false，这里重试几次 */
+  private async post(message: unknown): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (await this.panel.webview.postMessage(message)) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  setBusy(value: boolean): void {
+    void this.panel.webview.postMessage({ type: "busy", value });
+  }
+
+  /** 拉本题的提交记录，失败不影响题面展示 */
+  private async fetchSubmissions(): Promise<void> {
+    const pid = this.pid;
+    if (!this.deps.session.isLoggedIn) {
+      this.submissions = [];
+      return;
+    }
+    try {
+      const result = await problemApi.submissionList(this.deps.session.client, {
+        pid,
+        limit: 20,
+        ...this.context,
+      });
+      if (pid !== this.pid) {
+        return; // 期间切了题目，丢弃这次结果
+      }
+      this.submissions = result.records ?? [];
+    } catch (error) {
+      log(`[面板] 提交记录加载失败：${error instanceof Error ? error.message : String(error)}`);
+      this.submissions = [];
+    }
+    this.expandedSubmitId ??= this.submissions[0]?.submitId;
+  }
+
+  /** 提交记录列表：最新一条展开，其余折叠（只露状态 / 得分 / 时间） */
+  private renderSubmissionList(): string {
+    if (!this.deps.session.isLoggedIn) {
+      return `<p class="muted">登录后可以查看本题的提交记录。</p>`;
+    }
+    if (this.submissions.length === 0) {
+      return `<p class="muted">本题还没有提交记录。点击「提交当前文件」试试。</p>`;
+    }
+    const expanded = this.expandedSubmitId ?? this.submissions[0]?.submitId;
+    return this.submissions
+      .map((record) =>
+        renderSubmissionItem(
+          record,
+          this.details.get(record.submitId),
+          record.submitId === expanded,
+        ),
+      )
+      .join("");
+  }
+
+  /** 折叠项被展开时才去拉这条提交的评测详情 */
+  private async loadSubmissionDetail(submitId: number): Promise<void> {
+    const cached = this.details.get(submitId);
+    if (cached) {
+      void this.panel.webview.postMessage({
+        type: "submissionDetail",
+        submitId,
+        html: renderSubmissionResult(cached),
+      });
+      return;
+    }
+    try {
+      const detail = await problemApi.submissionDetail(this.deps.session.client, submitId);
+      this.details.set(submitId, detail);
+      void this.panel.webview.postMessage({
+        type: "submissionDetail",
+        submitId,
+        html: renderSubmissionResult(detail),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`[面板] 提交 ${submitId} 详情加载失败：${message}`);
+      void this.panel.webview.postMessage({
+        type: "submissionDetail",
+        submitId,
+        html: `<p class="bad">评测详情加载失败：${escapeHtml(message)}</p>`,
+      });
+    }
+  }
+
+  private async render(): Promise<void> {
+    if (!this.problem) {
+      return;
+    }
+    const base = this.problem.problemBaseVO;
+    const body = await renderMarkdown(base.content ?? "");
+    this.panel.title = `${base.problemId} ${base.title}`;
+    this.panel.webview.html = buildHtml(this.problem, {
+      bodyHtml: body,
+      accepted: this.problem.accepted,
+      contextHint: this.contextHint(),
+      kind: problemKind(this.problem),
+      submissionsHtml: this.renderSubmissionList(),
+      katexUri: this.katexUri,
+      cspSource: this.panel.webview.cspSource,
+    });
+  }
+
+  /** 面板顶部用来提示「这是从比赛/题单里打开的题目」 */
+  private contextHint(): string | undefined {
+    const context = this.context;
+    if (!context) {
+      return undefined;
+    }
+    const parts: string[] = [];
+    if (context.cid) {
+      parts.push("比赛题目");
+    }
+    if (context.tid) {
+      parts.push("题单题目");
+    }
+    if (parts.length === 0 && context.gid) {
+      parts.push("小组题目");
+    }
+    return parts.length > 0 ? parts.join(" · ") : undefined;
+  }
+
+  private async handleMessage(message: {
+    type: string;
+    action?: string;
+    submitId?: number;
+    code?: string;
+    answers?: Record<string, string>;
+  }): Promise<void> {
+    // 展开某条提交记录时才拉详情
+    if (message.type === "submissionDetail" && typeof message.submitId === "number") {
+      await this.loadSubmissionDetail(message.submitId);
+      return;
+    }
+    if (message.type !== "action" || !this.problem) {
+      return;
+    }
+    switch (message.action) {
+      case "code":
+        await this.deps.onOpenCodeFile(this.pid, this.problem.problemBaseVO.problemId, this.context);
+        break;
+      case "submit":
+        await this.deps.onSubmit(this.pid, this.context);
+        break;
+      case "submitAnswers": {
+        const kind = problemKind(this.problem);
+        const answers = message.answers ?? {};
+        // 选择题交的是选项 id，客观题交的是小题号 → 答案
+        const empty = kind === "choice" ? !message.code : Object.keys(answers).length === 0;
+        if (empty) {
+          void vscode.window.showWarningMessage("还没有作答，先选/填一下再提交。");
+          break;
+        }
+        await this.deps.onSubmitAnswers(this.pid, this.context, {
+          kind: kind === "choice" ? "choice" : "objective",
+          code: message.code,
+          answers,
+        });
+        break;
+      }
+      case "refresh":
+        await this.load();
+        break;
+      case "browser":
+        this.deps.onOpenInBrowser(this.pid, this.context);
+        break;
+    }
+  }
+
+  dispose(): void {
+    if (ProblemPanel.current === this) {
+      ProblemPanel.current = undefined;
+    }
+    this.panel.dispose();
+    while (this.disposables.length) {
+      this.disposables.pop()?.dispose();
+    }
+  }
+}
