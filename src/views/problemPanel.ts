@@ -232,10 +232,8 @@ function renderTestResult(result: TestJudgeResult): string {
     value
       ? `<p class="muted selftest-label">${label}</p><pre class="selftest-out">${escapeHtml(value)}</pre>`
       : "";
-  // 与网页端一致：通过看标准输出，未通过看 stderr
-  const body = ok
-    ? block("输出", result.userOutput)
-    : block("错误输出", result.stderr) || block("输出", result.userOutput);
+  // 标准输出和 stderr 都非空就都显示：程序打印过东西却被藏起来是最容易踩的坑
+  const body = `${block("输出", result.userOutput)}${block("错误输出", result.stderr)}`;
   const empty = result.resultCode !== 0 && !body && !result.userInput;
   return `${head}${block("输入", result.userInput)}${body}${block("期望输出", result.expectedOutput)}${
     empty ? `<p class="muted">运行结束，没有输出。</p>` : ""
@@ -836,6 +834,11 @@ export class ProblemPanel implements vscode.Disposable {
         ),
       )
       .join("");
+  }
+
+  /** 把一次自测结果回填到面板的自测区（命令行入口拿到结果后也走这里） */
+  showSelfTestResult(result: TestJudgeResult): void {
+    void this.post({ type: "selfTestResult", html: renderTestResult(result) });
   }
 
   /** 面板里的「运行自测」：输入交给扩展去跑，结果原地回填 */

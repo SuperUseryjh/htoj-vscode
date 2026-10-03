@@ -679,14 +679,17 @@ export function activate(context: vscode.ExtensionContext): void {
   /**
    * 提交自测并轮询结果。
    * 与网页端行为一致：2 秒一次；自测没有 submissionId，只有 testJudgeKey。
+   *
+   * 进度条故意设成不可取消：一旦中途取消就会拿到 resultCode=0 的半成品，
+   * 结果区只剩一句「运行中…」，输出就「看不见」了。超时上限已经能兜底。
    */
   const runSelfTest = async (
     target: SubmitTarget,
     userInput: string,
   ): Promise<TestJudgeResult> =>
     vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "正在运行自测…", cancellable: true },
-      async (progress, token) => {
+      { location: vscode.ProgressLocation.Notification, title: "正在运行自测…", cancellable: false },
+      async (progress) => {
         const ioMode = target.detail.problemOjDetailVO?.ioMode?.id ?? 1;
         log(
           `[自测] pid=${target.pid} ioMode=${ioMode} language=${target.language} 输入长度=${userInput.length}`,
@@ -707,7 +710,19 @@ export function activate(context: vscode.ExtensionContext): void {
         for (;;) {
           progress.report({ message: "等待运行结果…" });
           const result = await problem.testResult(session.client, testJudgeKey);
-          if (result.resultCode !== 0 || token.isCancellationRequested) {
+          if (result.resultCode !== 0) {
+            const size = (value: string | null | undefined) =>
+              value === null || value === undefined ? "null" : `${value.length}字符`;
+            log(
+              `[自测] 结果 resultCode=${result.resultCode} status=${result.status?.name ?? "-"} ` +
+                `输出=${size(result.userOutput)} 错误输出=${size(result.stderr)}`,
+            );
+            if (result.userOutput) {
+              log(`[自测] 输出内容：${JSON.stringify(result.userOutput.slice(0, 500))}`);
+            }
+            if (result.stderr) {
+              log(`[自测] 错误输出内容：${JSON.stringify(result.stderr.slice(0, 500))}`);
+            }
             return result;
           }
           if (Date.now() > deadline) {
@@ -1100,6 +1115,11 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const result = await runSelfTest(target, userInput);
       reportSelfTest(target.detail.problemBaseVO.problemId, result);
+      // 题面面板开着的话，把结果也回填到面板的自测区，别只躺在输出面板里
+      const panel = ProblemPanel.active;
+      if (panel && panel.currentPid === target.pid) {
+        panel.showSelfTestResult(result);
+      }
     } catch (error) {
       logError("[自测] 失败", error);
       void vscode.window.showErrorMessage(`自测失败：${errorMessage(error)}`);
