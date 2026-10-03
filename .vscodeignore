@@ -1,10 +1,12 @@
 .vscode/**
 .github/**
+.githooks/**
 node_modules/**
 src/**
 test/**
 re/**
 docs/**
+RELEASE_NOTE.md
 esbuild.js
 tsconfig.json
 bunfig.toml
@@ -13,4 +15,5 @@ bun.lockb
 package-lock.json
 **/*.map
 .gitignore
+.gitattributes
 docs/

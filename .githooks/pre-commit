@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# 拒绝「既不升版本、也不写发布说明」的提交：
+# 一次提交里 package.json 与 RELEASE_NOTE.md 至少改动一个，否则拦下。
+#
+# 安装：bun run hooks:install（等价于 git config core.hooksPath .githooks）
+# 跳过：git commit --no-verify
+
+changed="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+if printf '%s\n' "$changed" | grep -qE '^(package\.json|RELEASE_NOTE\.md)$'; then
+  exit 0
+fi
+
+echo "" >&2
+echo "提交被拒绝：package.json 和 RELEASE_NOTE.md 都没有改动。" >&2
+echo "  · 升版本：改 package.json 的 version，并在 RELEASE_NOTE.md 里补本次发布说明；或" >&2
+echo "  · 只更新 RELEASE_NOTE.md。" >&2
+echo "" >&2
+echo "本次提交涉及的文件：" >&2
+printf '%s\n' "$changed" | sed 's/^/  /' >&2
+echo "" >&2
+echo "确认要跳过检查：git commit --no-verify" >&2
+exit 1

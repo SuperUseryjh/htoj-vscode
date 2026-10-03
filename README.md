@@ -169,15 +169,30 @@ bun x @vscode/vsce package --no-dependencies     # 产出 htoj-vscode-<version>.
 
 ### 发布
 
-推送 `vX.Y.Z` 形式的 tag 会触发 `.github/workflows/release.yml`：类型检查 → 跑测试 → 打包 → 创建 GitHub Release 并把 `.vsix` 挂上去。
+版本号的唯一来源是 `package.json`，发布说明的唯一来源是 `RELEASE_NOTE.md`（GitHub Release 的正文直接取这个文件）。**整个流程不依赖 tag。**
+
+`.github/workflows/release.yml` 在任何 push（以及手动触发）时都会无条件跑完整流程：读版本号 → 类型检查 → 跑测试 → 打包 → 上传产物 → 创建/更新 GitHub Release（tag 由版本号生成 `vX.Y.Z`，标题取版本号，正文取 `RELEASE_NOTE.md`）→ 发布到插件市场。
 
 ```bash
-# 版本号和 tag 必须一致，workflow 会校验
-bun re/bump-version.ts 1.0.1
-git commit -am "chore: 1.0.1"
-git tag v1.0.1
-git push origin main --tags
+bun re/bump-version.ts 1.0.1     # 改 package.json 的版本号
+# 然后更新 RELEASE_NOTE.md，写清这个版本改了什么
+git commit -am "chore: 1.0.1"    # git hook 要求这两者至少改一个
+git push                         # 不需要打 tag
 ```
+
+> 版本号没升就 push 的话，最后两步会失败：Release 那步是「更新同名 Release」（无害），但 `vsce publish` 会因为「该版本已存在」报错。不想让流水线变红，给发布那步加一行 `continue-on-error: true` 即可。
+
+### Git hooks
+
+`.githooks/pre-commit` 会拒绝「`package.json` 与 `RELEASE_NOTE.md` 都没改动」的提交——逼着每次提交至少带上版本号变更或发布说明：
+
+```bash
+bun run hooks:install            # 等价于 git config core.hooksPath .githooks
+```
+
+单次跳过检查：`git commit --no-verify`。
+
+### 发布到插件市场
 
 想同时发到 VS Code 插件市场，走的是 **OIDC 可信发布**（`vsce publish --oidc`）：不用存任何长期 token，workflow 用 GitHub 自己的 OIDC 身份去换一个短期凭证。前提是在市场后台给这个仓库配一条 trusted publishing 策略：
 

@@ -1,10 +1,9 @@
 name: 构建与发布
 
-# 打 tag（v1.0.0 这种）时自动打包并发布；也可以手动跑一次只构建不发布
+# 任何 push 都无条件跑完整流程，不需要 tag 参与。
+# 版本号唯一来源是 package.json，发布说明唯一来源是 RELEASE_NOTE.md。
 on:
   push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 # 创建 Release 需要 contents:write；OIDC 可信发布需要 id-token:write
@@ -32,16 +31,13 @@ jobs:
         with:
           node-version: 22
 
-      - name: 校验 tag 与 package.json 版本一致
-        if: startsWith(github.ref, 'refs/tags/')
+      # 版本号唯一来源是 package.json（vsce 打包时也是读它），供产物命名、Release 的 tag 与标题用
+      - name: 读取 package.json 版本号
+        id: version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
           version="$(node -p "require('./package.json').version")"
-          echo "tag=$tag package.json=$version"
-          if [ "$tag" != "$version" ]; then
-            echo "::error::tag v$tag 与 package.json 的版本 $version 不一致，先改版本号再打 tag"
-            exit 1
-          fi
+          echo "package.json version=$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: 安装依赖
         run: bun install --frozen-lockfile
@@ -60,20 +56,26 @@ jobs:
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: vsix
+          name: htoj-vscode-${{ steps.version.outputs.version }}
           path: "*.vsix"
           if-no-files-found: error
 
-      - name: 创建 GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+      # tag 由版本号生成（vX.Y.Z），所以不需要手动打 tag；
+      # 同名 Release 已存在时是「更新」而不是重复创建。
+      # 发布说明直接从 RELEASE_NOTE.md 读，不用 GitHub 自动生成的。
+      - name: 创建 / 更新 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          # 不加这个的话 tag 会建在默认分支上，推其它分支时指向的提交可能是错的
+          target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTE.md
           files: "*.vsix"
-          generate_release_notes: true
 
       # 可信发布：用 GitHub OIDC 换市场的短期凭证，不需要存任何长期 token。
       # 前提：已在市场后台给「本仓库 + 本 workflow 文件名」配好 trusted publishing 策略。
       # 注意 --oidc 是 vsce 4.0 才有的，所以这里锁 4.x
+      # 版本号没升就 push 时这步会因「该版本已存在」失败，不想让流水线变红可加 continue-on-error: true
       - name: 发布到 VS Code Marketplace
-        if: startsWith(github.ref, 'refs/tags/')
         run: npx --yes @vscode/vsce@4 publish --packagePath htoj-vscode-*.vsix --oidc

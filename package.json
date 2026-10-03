@@ -357,7 +357,8 @@
     "check": "bunx tsc --noEmit",
     "test": "bun test",
     "package": "bun esbuild.js --production",
-    "vscode:prepublish": "bun esbuild.js --production"
+    "vscode:prepublish": "bun esbuild.js --production",
+    "hooks:install": "git config core.hooksPath .githooks"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
