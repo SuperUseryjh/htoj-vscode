@@ -194,13 +194,15 @@ bun run hooks:install            # 等价于 git config core.hooksPath .githooks
 
 ### 发布到插件市场
 
-想同时发到 VS Code 插件市场，走的是 **OIDC 可信发布**（`vsce publish --oidc`）：不用存任何长期 token，workflow 用 GitHub 自己的 OIDC 身份去换一个短期凭证。前提是在市场后台给这个仓库配一条 trusted publishing 策略：
+发布走 **OIDC 可信发布**（`vsce publish --oidc`）：不用存任何长期 token，workflow 用 GitHub 自己的 OIDC 身份去换一个短期凭证。前提是在市场后台给这个仓库配一条 trusted publishing 策略：
 
 - Repository：本仓库（`<owner>/htoj-vscode`）
 - Workflow file：`release.yml`
 - Publisher：`YaoOnion`（与 `package.json` 的 `publisher` 一致）
 
-配好之前推 tag，最后那步发布可能会失败——构建、Release 与 `.vsix` 不受影响。
+> **vsce 版本必须锁在 `4.0.1-x`**（workflow 里由 job 级 env `$VSCE` 统一指定）。`4.0.0`（npm 上的 `latest`）做 OIDC 交换时没带 `api-version`，Marketplace 会直接回 `400 No api-version was supplied`；修复见 [microsoft/vscode-vsce#1337](https://github.com/microsoft/vscode-vsce/pull/1337)，但只发在预发布通道（npm dist-tag `next`）。等 4.0.1 正式版出来后可改回 `@vscode/vsce@4`。
+
+策略配好之前，流水线最后那步会失败——构建、Release 与 `.vsix` 不受影响。
 
 ## 许可
 
