@@ -2,24 +2,20 @@ name: 构建与发布
 
 # 任何 push 都无条件跑完整流程，不需要 tag 参与。
 # 版本号唯一来源是 package.json，发布说明唯一来源是 RELEASE_NOTE.md。
+#
+# 这里只负责「构建 + 建 Release + 挂上 vsix」。
+# 发到 VS Code 插件市场是手动动作：去市场后台把 Release 里的 .vsix 传上去，原因见 README「发布到插件市场」。
 on:
   push:
   workflow_dispatch:
 
-# 创建 Release 需要 contents:write；OIDC 可信发布需要 id-token:write
+# 建 Release 需要 contents:write
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      # 必须锁到 4.0.1-x：4.0.0（当前 latest）做 OIDC 交换时没带 api-version，
-      # Marketplace 会回 400「No api-version was supplied」。
-      # 修复见 microsoft/vscode-vsce#1337，目前只在预发布通道（npm dist-tag: next）。
-      # 等 4.0.1 正式版发布后改回 "@vscode/vsce@4" 即可。
-      VSCE: "@vscode/vsce@4.0.1-3"
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -56,7 +52,7 @@ jobs:
 
       - name: 打包 vsix
         run: |
-          npx --yes "$VSCE" package --no-dependencies
+          npx --yes @vscode/vsce@4 package --no-dependencies
           ls -lh ./*.vsix
 
       - name: 上传构建产物
@@ -79,9 +75,7 @@ jobs:
           body_path: RELEASE_NOTE.md
           files: "*.vsix"
 
-      # 可信发布：用 GitHub OIDC 换市场的短期凭证，不需要存任何长期 token。
-      # 前提：已在市场后台给「本仓库 + 本 workflow 文件名」配好 trusted publishing 策略。
-      # --oidc 是 vsce 4.0 才有的；版本锁在 job 级 env 的 $VSCE，原因见那里。
-      # 版本号没升就 push 时这步会因「该版本已存在」失败，不想让流水线变红可加 continue-on-error: true
-      - name: 发布到 VS Code Marketplace
-        run: npx --yes "$VSCE" publish --packagePath htoj-vscode-*.vsix --oidc
+      # 不在这里发插件市场：
+      #   · vsce publish --oidc（GitHub OIDC 可信发布）市场侧返回「Trusted Publishing is not supported」
+      #   · vsce publish（PAT）需要 Azure DevOps 组织，而现在建组织必须先绑 Azure 订阅
+      # 改为手动：到 https://marketplace.visualstudio.com/manage/publishers/YaoOnion 上传本 Release 里的 .vsix

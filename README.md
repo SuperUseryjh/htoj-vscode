@@ -171,7 +171,7 @@ bun x @vscode/vsce package --no-dependencies     # 产出 htoj-vscode-<version>.
 
 版本号的唯一来源是 `package.json`，发布说明的唯一来源是 `RELEASE_NOTE.md`（GitHub Release 的正文直接取这个文件）。**整个流程不依赖 tag。**
 
-`.github/workflows/release.yml` 在任何 push（以及手动触发）时都会无条件跑完整流程：读版本号 → 类型检查 → 跑测试 → 打包 → 上传产物 → 创建/更新 GitHub Release（tag 由版本号生成 `vX.Y.Z`，标题取版本号，正文取 `RELEASE_NOTE.md`）→ 发布到插件市场。
+`.github/workflows/release.yml` 在任何 push（以及手动触发）时都会无条件跑完整流程：读版本号 → 类型检查 → 跑测试 → 打包 → 上传产物 → 创建/更新 GitHub Release（tag 由版本号生成 `vX.Y.Z`，标题取版本号，正文取 `RELEASE_NOTE.md`，并把 `.vsix` 挂上去）。
 
 ```bash
 bun re/bump-version.ts 1.0.1     # 改 package.json 的版本号
@@ -180,7 +180,7 @@ git commit -am "chore: 1.0.1"    # git hook 要求这两者至少改一个
 git push                         # 不需要打 tag
 ```
 
-> 版本号没升就 push 的话，最后两步会失败：Release 那步是「更新同名 Release」（无害），但 `vsce publish` 会因为「该版本已存在」报错。不想让流水线变红，给发布那步加一行 `continue-on-error: true` 即可。
+> 版本号没升就 push 的话，Release 那步只是「更新同名 Release」，无害。
 
 ### Git hooks
 
@@ -192,17 +192,21 @@ bun run hooks:install            # 等价于 git config core.hooksPath .githooks
 
 单次跳过检查：`git commit --no-verify`。
 
-### 发布到插件市场
+### 发布到插件市场（手动）
 
-发布走 **OIDC 可信发布**（`vsce publish --oidc`）：不用存任何长期 token，workflow 用 GitHub 自己的 OIDC 身份去换一个短期凭证。前提是在市场后台给这个仓库配一条 trusted publishing 策略：
+CI **不自动发布**到 VS Code 插件市场，改成手动上传一个文件：
 
-- Repository：本仓库（`<owner>/htoj-vscode`）
-- Workflow file：`release.yml`
-- Publisher：`YaoOnion`（与 `package.json` 的 `publisher` 一致）
+1. 等 push 触发的 workflow 跑完，在 GitHub 的 Release 里下载 `htoj-vscode-<版本>.vsix`（或从该次运行的 Artifacts 里下）
+2. 打开 <https://marketplace.visualstudio.com/manage/publishers/YaoOnion>，在「核桃 OJ」那一行点 **More Actions...**（⋯）→ **Update**，选中这个 `.vsix`
+3. 等市场索引几分钟，用户即可收到更新
 
-> **vsce 版本必须锁在 `4.0.1-x`**（workflow 里由 job 级 env `$VSCE` 统一指定）。`4.0.0`（npm 上的 `latest`）做 OIDC 交换时没带 `api-version`，Marketplace 会直接回 `400 No api-version was supplied`；修复见 [microsoft/vscode-vsce#1337](https://github.com/microsoft/vscode-vsce/pull/1337)，但只发在预发布通道（npm dist-tag `next`）。等 4.0.1 正式版出来后可改回 `@vscode/vsce@4`。
+之所以不能自动化（两条自动化路径都走不通）：
 
-策略配好之前，流水线最后那步会失败——构建、Release 与 `.vsix` 不受影响。
+- **`vsce publish --oidc`（GitHub OIDC 可信发布）**：市场侧的 token 交换接口直接返回 `Trusted Publishing is not supported`。vsce 4.0.0 还有 `api-version` 缺失的 bug（见 [#1337](https://github.com/microsoft/vscode-vsce/pull/1337)），但换成修好的 4.0.1-3 后仍然被市场拒绝——这条路目前对普通发布者没有开放配置入口。
+- **`vsce publish` + PAT**：PAT 必须来自 Azure DevOps 组织，而现在**创建 Azure DevOps 组织要求先绑定 Azure 订阅**（账号下没有订阅时会提示 *To create an Azure DevOps organization, you need to link it to an Azure subscription*）。
+- 同理，官方推荐的 Entra ID 工作负载身份（`vsce publish --azure-credential`）也需要 Azure 订阅。
+
+如果以后有了 Azure 订阅，可以按[官方文档](https://code.visualstudio.com/api/working-with-extensions/publishing-extension#secure-automated-publishing-to-visual-studio-marketplace)配 Entra ID 联邦凭据，再把发布步骤加回 workflow；另一种免 Azure 的自动化是发到 [Open VSX](https://open-vsx.org)（`ovsx publish` + `OVSX_PAT`）。
 
 ## 许可
 
