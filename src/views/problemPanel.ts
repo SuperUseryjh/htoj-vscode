@@ -7,6 +7,7 @@ import type {
   SubmissionAnswer,
   SubmissionDetail,
   SubmissionRecord,
+  TestJudgeResult,
 } from "../api/types";
 import type { Session } from "../session";
 import { log } from "../util/logger";
@@ -24,6 +25,12 @@ export interface ProblemPanelDeps {
     context: ProblemContext | undefined,
     payload: { kind: "choice" | "objective"; code?: string; answers?: Record<string, string> },
   ): Promise<void>;
+  /** 自测运行（不产生提交记录） */
+  onSelfTest(
+    pid: number,
+    context: ProblemContext | undefined,
+    userInput: string,
+  ): Promise<TestJudgeResult>;
   /** 在浏览器中打开题目 */
   onOpenInBrowser(pid: number, context?: ProblemContext): void;
 }
@@ -207,6 +214,34 @@ function answerTable(answers: SubmissionAnswer[] | null | undefined): string | u
   </table>`;
 }
 
+/** 自测运行结果 → HTML 片段 */
+function renderTestResult(result: TestJudgeResult): string {
+  const ok = result.resultCode === 1;
+  const status = result.status?.chineseName || result.status?.name || (ok ? "运行通过" : "运行失败");
+  const meta = [
+    result.time === null ? undefined : `用时 ${result.time}ms`,
+    result.memory === null ? undefined : `内存 ${result.memory}KB`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const head =
+    result.resultCode === 0
+      ? `<p class="muted">运行中…</p>`
+      : `<p class="${ok ? "ok" : "bad"}">${escapeHtml(status)}${meta ? ` · ${escapeHtml(meta)}` : ""}</p>`;
+  const block = (label: string, value?: string | null): string =>
+    value
+      ? `<p class="muted selftest-label">${label}</p><pre class="selftest-out">${escapeHtml(value)}</pre>`
+      : "";
+  // 与网页端一致：通过看标准输出，未通过看 stderr
+  const body = ok
+    ? block("输出", result.userOutput)
+    : block("错误输出", result.stderr) || block("输出", result.userOutput);
+  const empty = result.resultCode !== 0 && !body && !result.userInput;
+  return `${head}${block("输入", result.userInput)}${body}${block("期望输出", result.expectedOutput)}${
+    empty ? `<p class="muted">运行结束，没有输出。</p>` : ""
+  }`;
+}
+
 /**
  * 题目大类。接口的 `problemBaseVO.type`：1=OJ 编程题 2=选择题 5=客观题。
  * 选择题和客观题都是「提交答案」而不是提交代码，面板要换一套交互。
@@ -282,6 +317,19 @@ function buildHtml(problem: ProblemDetail, options: BuildHtmlOptions): string {
   const ioFiles =
     oj && oj.ioMode?.id === 2 && (oj.ioReadFileName || oj.ioWriteFileName)
       ? `<div class="meta fileio">文件 IO：读 <code>${escapeHtml(oj.ioReadFileName ?? "-")}</code> · 写 <code>${escapeHtml(oj.ioWriteFileName ?? "-")}</code></div>`
+      : "";
+  // 只有编程题能自测；输入上限与网页端一致（手动输入 1MB）
+  const selfTestHtml =
+    kind === "oj"
+      ? `<section id="selftest-section">
+  <h2>自测运行</h2>
+  <p class="muted">不产生提交记录。测试输入上限 1MB，更大的输入请用命令「核桃OJ: 运行自测」从文件读取。</p>
+  <textarea id="selftest-input" class="selftest-input" placeholder="在这里粘贴测试输入（可留空）"></textarea>
+  <div class="toolbar">
+    <button data-action="selfTest" class="primary">运行自测</button>
+  </div>
+  <div id="selftest-result" class="selftest-result"></div>
+</section>`
       : "";
 
   return `<!DOCTYPE html>
@@ -395,6 +443,30 @@ ${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
   .choices .objective-input { min-width: 0; }
   .objective-option { display: flex; gap: 8px; align-items: flex-start; padding: 2px 0; cursor: pointer; }
   #description label.objective-option { margin-left: 0; }
+  /* 自测运行：输入框 + 输出回显 */
+  .selftest-input {
+    display: block;
+    width: 100%;
+    min-height: 5em;
+    box-sizing: border-box;
+    resize: vertical;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: inherit;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    border-radius: 4px;
+    padding: 8px;
+  }
+  .selftest-result { margin-top: 8px; }
+  .selftest-label { margin: 8px 0 0; font-size: 0.92em; }
+  .selftest-out {
+    margin: 4px 0 0;
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
 </style>
 </head>
 <body>
@@ -420,6 +492,7 @@ ${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
   <div id="description">${bodyHtml}</div>
   ${choicesHtml}
 </section>
+${selfTestHtml}
 <section id="submissions-section">
   <h2>提交记录</h2>
   <div id="submissions">${submissionsHtml}</div>
@@ -510,8 +583,21 @@ ${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
 
   document.querySelectorAll("button[data-action]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const message = { type: "action", action: btn.dataset.action };
-      if (btn.dataset.action === "submitAnswers") Object.assign(message, readAnswers());
+      const action = btn.dataset.action;
+      const message = { type: "action", action };
+      if (action === "submitAnswers") Object.assign(message, readAnswers());
+      if (action === "selfTest") {
+        const box = document.getElementById("selftest-input");
+        const text = box ? box.value : "";
+        // 手动输入超过 1MB 服务端会拒，先在本地拦下来
+        if (new TextEncoder().encode(text).length > 1048576) {
+          document.getElementById("selftest-result").innerHTML =
+            '<p class="bad">测试输入超过 1MB（服务端手动输入上限）。请改用命令「核桃OJ: 运行自测」从文件读取。</p>';
+          return;
+        }
+        message.input = text;
+        document.getElementById("selftest-result").innerHTML = '<p class="muted">正在运行自测…</p>';
+      }
       vscode.postMessage(message);
     });
   });
@@ -547,6 +633,9 @@ ${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
         body.dataset.pending = "0";
         body.innerHTML = message.html;
       }
+    } else if (message.type === "selfTestResult") {
+      const box = document.getElementById("selftest-result");
+      if (box) box.innerHTML = message.html;
     } else if (message.type === "scroll") {
       const target = document.querySelector(message.selector);
       if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -749,6 +838,25 @@ export class ProblemPanel implements vscode.Disposable {
       .join("");
   }
 
+  /** 面板里的「运行自测」：输入交给扩展去跑，结果原地回填 */
+  private async runSelfTest(userInput: string): Promise<void> {
+    this.setBusy(true);
+    await this.post({ type: "selfTestResult", html: `<p class="muted">正在运行自测…</p>` });
+    try {
+      const result = await this.deps.onSelfTest(this.pid, this.context, userInput);
+      await this.post({ type: "selfTestResult", html: renderTestResult(result) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`[面板] 自测失败：${message}`);
+      await this.post({
+        type: "selfTestResult",
+        html: `<p class="bad">自测失败：${escapeHtml(message)}</p>`,
+      });
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
   /** 折叠项被展开时才去拉这条提交的评测详情 */
   private async loadSubmissionDetail(submitId: number): Promise<void> {
     const cached = this.details.get(submitId);
@@ -822,6 +930,7 @@ export class ProblemPanel implements vscode.Disposable {
     submitId?: number;
     code?: string;
     answers?: Record<string, string>;
+    input?: string;
   }): Promise<void> {
     // 展开某条提交记录时才拉详情
     if (message.type === "submissionDetail" && typeof message.submitId === "number") {
@@ -854,6 +963,9 @@ export class ProblemPanel implements vscode.Disposable {
         });
         break;
       }
+      case "selfTest":
+        await this.runSelfTest(message.input ?? "");
+        break;
       case "refresh":
         await this.load();
         break;

@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { HtojApiError } from "./api/client";
 import { contest, problem, training } from "./api/endpoints";
-import type { ProblemContext, SubmissionDetail } from "./api/types";
+import type { ProblemContext, ProblemDetail, SubmissionDetail, TestJudgeResult } from "./api/types";
 import { openCodeFile, parseProblemFromDocument } from "./codeFile";
 import { ContestCountdown } from "./contestCountdown";
 import { Session } from "./session";
@@ -403,6 +403,13 @@ export function activate(context: vscode.ExtensionContext): void {
     ) => {
       await submitAnswers(pid, context, payload);
     },
+    onSelfTest: async (pid: number, context: ProblemContext | undefined, userInput: string) => {
+      const target = await resolveTarget("自测", pid, context);
+      if (!target) {
+        throw new Error("没有选定要自测的代码文件。");
+      }
+      return runSelfTest(target, userInput);
+    },
     onOpenInBrowser: (pid: number, context?: ProblemContext) => {
       void vscode.env.openExternal(browserUrl(problemPagePath(pid, context)));
     },
@@ -415,15 +422,33 @@ export function activate(context: vscode.ExtensionContext): void {
     await ProblemPanel.show(panelDeps, pid, context);
   };
 
-  /** 提交代码并轮询评测结果 */
-  const submitProblem = async (pidArg?: number, contextArg?: ProblemContext): Promise<void> => {
+  /** 提交 / 自测共用的一次「目标解析」结果 */
+  interface SubmitTarget {
+    editor: vscode.TextEditor;
+    pid: number;
+    context: ProblemContext | undefined;
+    code: string;
+    language: string;
+    /** 题目详情，已确认是 OJ 编程题 */
+    detail: ProblemDetail;
+  }
+
+  /**
+   * 解析「要操作哪道题的哪份代码」：选编辑器 → 定位 pid → 拉题目详情。
+   * 用户取消时返回 undefined；接口出错时抛出，交给调用方按自己的口径提示。
+   */
+  const resolveTarget = async (
+    scope: string,
+    pidArg?: number,
+    contextArg?: ProblemContext,
+  ): Promise<SubmitTarget | undefined> => {
     if (!requireLogin()) {
-      return;
+      return undefined;
     }
     const editor = await pickSubmitEditor(pidArg);
     if (!editor) {
-      log("[提交] 用户没有选定要提交的文件，已取消");
-      return;
+      log(`[${scope}] 用户没有选定要操作的文件，已取消`);
+      return undefined;
     }
     if (editor.document.isDirty) {
       await editor.document.save();
@@ -434,9 +459,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const pid = pidArg ?? fromFile?.pid ?? panel?.currentPid;
     if (!pid) {
       void vscode.window.showWarningMessage(
-        "无法确定要提交到哪道题：请先从题目列表打开题目，或使用「新建/打开本地代码文件」。",
+        "无法确定要操作哪道题：请先从题目列表打开题目，或使用「新建/打开本地代码文件」。",
       );
-      return;
+      return undefined;
     }
 
     // 比赛/题单题目的上下文：文件标记或当前面板里带的，显式传参优先
@@ -451,7 +476,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const code = editor.document.getText();
     if (!code.trim()) {
       void vscode.window.showWarningMessage("当前文件是空的。");
-      return;
+      return undefined;
     }
 
     const language = /\.py$/i.test(editor.document.fileName)
@@ -459,17 +484,61 @@ export function activate(context: vscode.ExtensionContext): void {
       : (config().get<string>("defaultLanguage") ?? "C++17 With O2");
 
     log(
-      `[提交] 文件=${editor.document.fileName} pid=${pid}（来源：${
+      `[${scope}] 文件=${editor.document.fileName} pid=${pid}（来源：${
         pidArg !== undefined ? "参数" : fromFile ? "文件标记" : "当前面板"
       }）language=${language} 代码长度=${code.length}`,
       context ? `上下文=${JSON.stringify(context)}` : "无上下文",
     );
 
+    const detail = await problem.detail(session.client, pid, context);
+    // 选择题 / 客观题交的是答案不是代码，别让提交/自测把文件内容当成答案送上去
+    if (detail.problemBaseVO.type !== 1) {
+      void vscode.window.showWarningMessage("这是选择题/客观题，请在题面面板里作答后点「提交答案」。");
+      return undefined;
+    }
+    return { editor, pid, context, code, language, detail };
+  };
+
+  /**
+   * 提交前的体积检查。超过上限就不提交，改成提示去跑自测。
+   * 返回 true 表示已经拦下这次提交。
+   */
+  const rejectOversizedCode = (
+    code: string,
+    pid: number,
+    context: ProblemContext | undefined,
+  ): boolean => {
+    const maxBytes = config().get<number>("maxSubmitBytes") ?? 102400;
+    if (maxBytes <= 0) {
+      return false;
+    }
+    const bytes = Buffer.byteLength(code, "utf8");
+    if (bytes <= maxBytes) {
+      return false;
+    }
+    log(`[提交] 文件过大：${bytes} 字节 > 上限 ${maxBytes} 字节，已取消提交`);
+    void vscode.window
+      .showWarningMessage(
+        `代码文件过大（${(bytes / 1024).toFixed(1)} KB，超过 ${(maxBytes / 1024).toFixed(1)} KB 上限），已取消提交。可以用「运行自测」验证代码是否跑得起来（自测不产生提交记录）。`,
+        "运行自测",
+      )
+      .then((choice) => {
+        if (choice === "运行自测") {
+          void vscode.commands.executeCommand("htoj.selfTest", { pid, context });
+        }
+      });
+    return true;
+  };
+
+  /** 提交代码并轮询评测结果 */
+  const submitProblem = async (pidArg?: number, contextArg?: ProblemContext): Promise<void> => {
     try {
-      const detail = await problem.detail(session.client, pid, context);
-      // 选择题 / 客观题交的是答案不是代码，别让快捷键把文件内容当成答案提交上去
-      if (detail.problemBaseVO.type !== 1) {
-        void vscode.window.showWarningMessage("这是选择题/客观题，请在题面面板里作答后点「提交答案」。");
+      const target = await resolveTarget("提交", pidArg, contextArg);
+      if (!target) {
+        return;
+      }
+      const { pid, context, code, language, detail } = target;
+      if (rejectOversizedCode(code, pid, context)) {
         return;
       }
       const ioMode = detail.problemOjDetailVO?.ioMode?.id ?? 1;
@@ -599,6 +668,143 @@ export function activate(context: vscode.ExtensionContext): void {
       const opened = await ProblemPanel.show(panelDeps, pid, context);
       void opened.showResult(detail);
     }
+  };
+
+  // ---------------------------------------------------------------------
+  // 自测运行（不产生提交记录）
+  // ---------------------------------------------------------------------
+  /** 手动输入走 userInput，服务端上限 1MB */
+  const SELF_TEST_INPUT_LIMIT = 1024 * 1024;
+
+  /**
+   * 提交自测并轮询结果。
+   * 与网页端行为一致：2 秒一次；自测没有 submissionId，只有 testJudgeKey。
+   */
+  const runSelfTest = async (
+    target: SubmitTarget,
+    userInput: string,
+  ): Promise<TestJudgeResult> =>
+    vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "正在运行自测…", cancellable: true },
+      async (progress, token) => {
+        const ioMode = target.detail.problemOjDetailVO?.ioMode?.id ?? 1;
+        log(
+          `[自测] pid=${target.pid} ioMode=${ioMode} language=${target.language} 输入长度=${userInput.length}`,
+        );
+        const testJudgeKey = await problem.testSubmit(session.client, {
+          id: target.pid,
+          ioMode,
+          language: target.language,
+          code: target.code,
+          userInput,
+          ...target.context,
+        });
+        log(`[自测] 已提交，testJudgeKey=${testJudgeKey}`);
+
+        const interval = config().get<number>("pollIntervalMs") ?? 2000;
+        const timeout = config().get<number>("pollTimeoutMs") ?? 60000;
+        const deadline = Date.now() + timeout;
+        for (;;) {
+          progress.report({ message: "等待运行结果…" });
+          const result = await problem.testResult(session.client, testJudgeKey);
+          if (result.resultCode !== 0 || token.isCancellationRequested) {
+            return result;
+          }
+          if (Date.now() > deadline) {
+            throw new Error(`自测超时（${timeout / 1000}s）。`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, interval));
+        }
+      },
+    );
+
+  /** 命令行自测的输入从哪来：文件 / 手动单行 / 空输入 */
+  const pickSelfTestInput = async (): Promise<string | undefined> => {
+    const picked = await vscode.window.showQuickPick(
+      [
+        { label: "$(file) 从文件读取测试输入…", description: "适合多行或较大的输入", value: "file" as const },
+        { label: "$(edit) 手动输入（单行）", description: "多行输入建议用题面面板里的自测区", value: "manual" as const },
+        { label: "$(debug-start) 不输入，直接运行", value: "empty" as const },
+      ],
+      { title: "自测输入", placeHolder: "用哪份数据运行这次自测？" },
+    );
+    if (!picked) {
+      return undefined;
+    }
+    if (picked.value === "empty") {
+      return "";
+    }
+    if (picked.value === "manual") {
+      return vscode.window.showInputBox({
+        title: "自测输入（单行）",
+        prompt: "服务端手动输入上限 1MB",
+        ignoreFocusOut: true,
+      });
+    }
+
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      title: "选择测试输入文件",
+      filters: { 测试数据: ["in", "txt", "out", "ans"], 所有文件: ["*"] },
+    });
+    if (!uris?.length) {
+      return undefined;
+    }
+    const bytes = await vscode.workspace.fs.readFile(uris[0]);
+    if (bytes.byteLength > SELF_TEST_INPUT_LIMIT) {
+      void vscode.window.showWarningMessage(
+        `输入文件过大（${(bytes.byteLength / 1024 / 1024).toFixed(1)} MB），服务端手动输入上限为 1MB。`,
+      );
+      return undefined;
+    }
+    return Buffer.from(bytes).toString("utf8");
+  };
+
+  /** 自测结果 → 纯文本（写进输出面板用） */
+  const formatTestResult = (displayId: string, result: TestJudgeResult): string => {
+    const status = result.status?.chineseName || result.status?.name || "未知";
+    const lines = [`===== ${displayId} 自测（${status}） =====`];
+    if (result.time !== null || result.memory !== null) {
+      lines.push(`用时 ${result.time ?? "-"}ms · 内存 ${result.memory ?? "-"}KB`);
+    }
+    if (result.userInput) {
+      lines.push("--- 输入 ---", result.userInput);
+    }
+    if (result.userOutput) {
+      lines.push("--- 输出 ---", result.userOutput);
+    }
+    if (result.stderr) {
+      lines.push("--- 错误输出 ---", result.stderr);
+    }
+    if (result.expectedOutput) {
+      lines.push("--- 期望输出 ---", result.expectedOutput);
+    }
+    return lines.join("\n");
+  };
+
+  /** 命令行自测的结果：摘要弹窗 + 完整内容追加到输出面板 */
+  const reportSelfTest = (displayId: string, result: TestJudgeResult): void => {
+    const channel = getChannel();
+    channel.appendLine("");
+    channel.appendLine(formatTestResult(displayId, result));
+
+    const ok = result.resultCode === 1;
+    const status = result.status?.chineseName || result.status?.name || "未知";
+    const meta = [
+      result.time === null ? undefined : `${result.time}ms`,
+      result.memory === null ? undefined : `${result.memory}KB`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const message = `自测${ok ? "通过" : "未通过"}：${status}${meta ? `（${meta}）` : ""}`;
+    const chosen = ok
+      ? vscode.window.showInformationMessage(message, "查看输出")
+      : vscode.window.showWarningMessage(message, "查看输出");
+    void chosen.then((choice) => {
+      if (choice === "查看输出") {
+        channel.show(true);
+      }
+    });
   };
 
   // ---------------------------------------------------------------------
@@ -878,6 +1084,27 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   register("htoj.submit", (pid?: number, context?: ProblemContext) => submitProblem(pid, context));
+
+  /** 自测运行：命令行入口，输入从文件 / 手动 / 空值里选 */
+  register("htoj.selfTest", async (arg?: unknown) => {
+    const fromArg = resolveProblemArg(arg);
+    try {
+      const target = await resolveTarget("自测", fromArg?.pid, fromArg?.context);
+      if (!target) {
+        return;
+      }
+      const userInput = await pickSelfTestInput();
+      if (userInput === undefined) {
+        log("[自测] 用户没有指定输入，已取消");
+        return;
+      }
+      const result = await runSelfTest(target, userInput);
+      reportSelfTest(target.detail.problemBaseVO.problemId, result);
+    } catch (error) {
+      logError("[自测] 失败", error);
+      void vscode.window.showErrorMessage(`自测失败：${errorMessage(error)}`);
+    }
+  });
 
   register("htoj.showMySubmissions", async () => {
     if (!requireLogin()) {
