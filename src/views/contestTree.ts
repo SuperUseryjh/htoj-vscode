@@ -10,13 +10,21 @@ import {
   messageItem,
   moreItem,
   PageState,
+  PINNED_GROUP_LABEL,
+  type PinnedRef,
+  PinnedStore,
   problemTreeItem,
 } from "./common";
 
 export const CONTEST_VIEW_ID = "contests";
 
+/** 「手动添加的比赛」持久化用的 key（值是一组 PinnedRef，id 为 cid） */
+const PINNED_KEY = "htoj.pinnedContests";
+
 export type ContestNode =
-  | { kind: "contest"; value: ContestItem; key: string }
+  | { kind: "contest"; value: ContestItem; key: string; pinned?: boolean }
+  /** 「已添加的比赛」分组（只在有内容时出现） */
+  | { kind: "pinned" }
   | { kind: "detail"; value: ContestItem; key: string; forceStart?: boolean }
   | { kind: "problem"; value: ContestProblem; key: string; context: ProblemContext }
   | { kind: "more" }
@@ -184,8 +192,34 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
   private readonly loadingChildren = new Set<number>();
   /** cid → 我的得分与排名。展开过一场就缓存下来，比赛那一行也能直接显示 */
   private readonly myRanks = new Map<number, MyRank>();
+  /** 手动添加的比赛（带 gid 的小组赛列表接口不返回，只能靠链接钉进来） */
+  private readonly pinned: PinnedStore<ContestItem>;
 
-  constructor(private readonly session: Session) {}
+  constructor(
+    private readonly session: Session,
+    memento?: vscode.Memento,
+  ) {
+    this.pinned = new PinnedStore<ContestItem>(
+      PINNED_KEY,
+      memento,
+      (item) => item.id,
+      async (ref) => this.fetchContest(ref),
+    );
+  }
+
+  /**
+   * 拉一场比赛。
+   * gid 是小组赛的后端鉴权依据（不带给「该题目不可见」），get-contest-info 有时不回它，
+   * 那就用链接里带过来的补上。
+   */
+  private async fetchContest(ref: PinnedRef): Promise<ContestItem> {
+    const gid = ref.extra?.gid;
+    const info = await contest.info(this.session.client, { cid: ref.id, gid });
+    if (gid && !info.gid) {
+      info.gid = gid;
+    }
+    return info;
+  }
 
   refresh(): void {
     this.state.reset();
@@ -193,6 +227,35 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
     this.children.clear();
     this.loadingChildren.clear();
     this.myRanks.clear();
+    // 手动添加的那些要跟着重新拉一遍（比赛信息会变）
+    this.pinned.invalidate();
+    this.emitter.fire();
+  }
+
+  /** 列表里的和手动添加的一起算 */
+  private findContest(cid: number): ContestItem | undefined {
+    return this.pinned.find(cid) ?? this.state.items.find((item) => item.id === cid);
+  }
+
+  async loadPinned(): Promise<void> {
+    if (!this.session.isLoggedIn || this.pinned.isLoaded) {
+      return;
+    }
+    await this.pinned.load();
+    this.emitter.fire();
+  }
+
+  /** 按链接添加一场比赛；同一 cid 重复添加只会刷新顺序 */
+  async addPinned(cid: number, gid?: number): Promise<ContestItem | undefined> {
+    const info = await this.pinned.add({ id: cid, extra: gid ? { gid } : undefined });
+    this.children.delete(cid);
+    this.emitter.fire();
+    return info;
+  }
+
+  async removePinned(cid: number): Promise<void> {
+    await this.pinned.remove(cid);
+    this.children.delete(cid);
     this.emitter.fire();
   }
 
@@ -202,7 +265,7 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
    */
   activeContests(): ContestItem[] {
     const now = Date.now();
-    return this.state.items
+    return this.allContests()
       .filter(
         (item) =>
           item.status === 0 &&
@@ -212,14 +275,24 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
       .sort((a, b) => a.endTime - b.endTime);
   }
 
-  /** 已加载的比赛（倒计时选择器用），不改动内部状态 */
+  /** 已加载的比赛（倒计时选择器用），不改动内部状态；手动添加的那几场也算 */
   loadedContests(): ContestItem[] {
-    return [...this.state.items];
+    return this.allContests();
+  }
+
+  /** 列表里的 + 手动添加的 */
+  private allContests(): ContestItem[] {
+    return [...this.pinned.list, ...this.state.items];
   }
 
   /** 状态栏倒计时用：视图没被打开时 getChildren 不会被调用，这里主动补一次加载 */
   async ensureLoaded(): Promise<void> {
-    if (!this.session.isLoggedIn || this.state.page > 0 || this.state.loading) {
+    if (!this.session.isLoggedIn) {
+      return;
+    }
+    // 手动添加的场次和列表分页无关，先保证它被加载（加载过就是空操作）
+    await this.loadPinned();
+    if (this.state.page > 0 || this.state.loading) {
       return;
     }
     await this.loadMore();
@@ -227,7 +300,7 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
 
   /** 报名成功后就地更新状态并清掉子节点缓存，重新展开时会按已报名重新加载 */
   markRegistered(cid: number): void {
-    const record = this.state.items.find((item) => item.id === cid);
+    const record = this.findContest(cid);
     if (record) {
       record.registered = true;
     }
@@ -237,7 +310,7 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
 
   /** 开始比赛成功后就地更新状态并清掉子节点缓存，重新展开时会当作已开始加载题目 */
   markStarted(cid: number): void {
-    const record = this.state.items.find((item) => item.id === cid);
+    const record = this.findContest(cid);
     if (record) {
       record.started = true;
     }
@@ -268,6 +341,18 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
 
   getTreeItem(node: ContestNode): vscode.TreeItem {
     switch (node.kind) {
+      case "pinned": {
+        const item = new vscode.TreeItem(
+          `${PINNED_GROUP_LABEL}的比赛`,
+          vscode.TreeItemCollapsibleState.Expanded,
+        );
+        item.description = `${this.pinned.list.length} 场`;
+        item.iconPath = new vscode.ThemeIcon("pin");
+        item.tooltip = new vscode.MarkdownString(
+          "通过比赛链接手动添加的场次。\n\n_右键某一场可以移除；列表接口不返回带 `gid` 的小组赛，只能这样加。_",
+        );
+        return item;
+      }
       case "detail":
         return contestDetailItem(node.value, node.forceStart, this.myRanks.get(node.value.id));
       case "contest": {
@@ -303,8 +388,9 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
             "_单击展开题目；右键可在浏览器中打开_",
           ].join("\n"),
         );
-        // 报名入口挂在展开后的「比赛详情」块上，这里不需要再区分状态
-        item.contextValue = "htoj.contest";
+        // 报名入口挂在展开后的「比赛详情」块上，这里不需要再区分状态；
+        // 手动添加的单独一个 contextValue，好挂「移除」菜单
+        item.contextValue = node.pinned ? "htoj.contestPinned" : "htoj.contest";
         return item;
       }
       case "problem": {
@@ -334,27 +420,48 @@ export class ContestTreeProvider implements vscode.TreeDataProvider<ContestNode>
 
   getChildren(node?: ContestNode): ContestNode[] {
     if (node) {
+      if (node.kind === "pinned") {
+        return this.pinned.list.map((value) => ({
+          kind: "contest" as const,
+          value,
+          key: `pinned-${value.id}`,
+          pinned: true,
+        }));
+      }
       return node.kind === "contest" ? this.childrenOf(node.value) : [];
     }
     logViewState("比赛", this.state, `loggedIn=${this.session.isLoggedIn}`);
     if (!this.session.isLoggedIn) {
       return [];
     }
+    if (!this.pinned.isLoaded) {
+      void this.loadPinned();
+    }
+
+    const nodes: ContestNode[] = [];
+    // 「已添加的比赛」固定排在最前面；没有内容时整个分组不出现
+    if (this.pinned.list.length > 0) {
+      nodes.push({ kind: "pinned" });
+    }
     if (this.state.isEmpty) {
       if (this.state.error) {
-        return [{ kind: "message", text: `加载失败：${this.state.error}`, icon: "error" }];
+        nodes.push({ kind: "message", text: `加载失败：${this.state.error}`, icon: "error" });
+        return nodes;
       }
       if (!this.state.loading) {
         void this.loadMore();
       }
-      return [{ kind: "message", text: LOADING_ROOT_TEXT, icon: "loading~spin" }];
+      nodes.push({ kind: "message", text: LOADING_ROOT_TEXT, icon: "loading~spin" });
+      return nodes;
     }
 
-    const nodes: ContestNode[] = this.state.items.map((value) => ({
-      kind: "contest" as const,
-      value,
-      key: String(value.id),
-    }));
+    nodes.push(
+      ...this.state.items.map((value) => ({
+        kind: "contest" as const,
+        value,
+        key: String(value.id),
+      })),
+    );
     if (this.state.hasMore) {
       nodes.push({ kind: "more" });
     }

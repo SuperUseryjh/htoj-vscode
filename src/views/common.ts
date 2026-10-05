@@ -2,10 +2,20 @@ import * as vscode from "vscode";
 import type { ProblemContext } from "../api/types";
 import { log } from "../util/logger";
 
-/** 树节点：数据项 / 加载更多 / 提示信息 / 分组 */
+/** 树节点：数据项 / 加载更多 / 提示信息 / 分组 / 手动添加的分组 */
 export type ViewNode<T> =
-  | { kind: "item"; value: T; key: string }
+  | {
+      kind: "item";
+      value: T;
+      key: string;
+      /** 是不是「手动添加」进来的条目 */
+      pinned?: boolean;
+      /** 打开这道题要带的上下文（比赛题/题单题/小组题必须带，否则后端说不可见） */
+      context?: ProblemContext;
+    }
   | { kind: "group"; label: string; key: string }
+  /** 「已添加的…」分组标题，只在有内容时出现 */
+  | { kind: "pinned" }
   | { kind: "more" }
   | { kind: "message"; text: string; icon?: string };
 
@@ -69,6 +79,129 @@ export class PageState<T> {
     } finally {
       this.loading = false;
     }
+  }
+}
+
+/**
+ * 「手动添加」条目的持久化引用。
+ * id 是稳定标识（比赛 cid / 题目 pid / 题单 tid），extra 放其余参数（gid、题目上下文）。
+ */
+export interface PinnedRef {
+  id: number;
+  extra?: Record<string, number>;
+}
+
+/** 手动添加的分组标题文案（三个视图共用一套渲染） */
+export const PINNED_GROUP_LABEL = "已添加";
+
+/**
+ * 兼容早期版本存下的形式（比赛那版存的是 `{ cid, gid }`）。
+ * 读到旧格式就地转成 `{ id, extra }`，不然升级后原来钉的比赛会失效。
+ */
+function normalizeRef(entry: unknown): PinnedRef | undefined {
+  if (!entry || typeof entry !== "object") {
+    return undefined;
+  }
+  const record = entry as Record<string, unknown>;
+  if (typeof record.id === "number") {
+    return { id: record.id, extra: record.extra as Record<string, number> | undefined };
+  }
+  const id = record.cid ?? record.pid ?? record.tid;
+  if (typeof id !== "number") {
+    return undefined;
+  }
+  const extra: Record<string, number> = {};
+  for (const key of ["cid", "tid", "gid"] as const) {
+    if (typeof record[key] === "number") {
+      extra[key] = record[key] as number;
+    }
+  }
+  return { id, extra: Object.keys(extra).length > 0 ? extra : undefined };
+}
+
+/**
+ * 「手动添加」条目的存储：只持久化引用，展示数据每次重新拉。
+ * 比赛标题、题目通过率、题单进度都会变，存快照迟早过期。
+ */
+export class PinnedStore<T> {
+  private items: T[] = [];
+  private loaded = false;
+
+  constructor(
+    private readonly storageKey: string,
+    private readonly memento: vscode.Memento | undefined,
+    private readonly idOf: (item: T) => number,
+    private readonly fetch: (ref: PinnedRef) => Promise<T | undefined>,
+  ) {}
+
+  get list(): readonly T[] {
+    return this.items;
+  }
+
+  get isLoaded(): boolean {
+    return this.loaded;
+  }
+
+  find(id: number): T | undefined {
+    return this.items.find((item) => this.idOf(item) === id);
+  }
+
+  /** 下次 getChildren 时重新拉一遍（比赛/题单信息会变） */
+  invalidate(): void {
+    this.loaded = false;
+  }
+
+  /** 把持久化过的条目都拉出来；重复调用是空操作 */
+  async load(): Promise<void> {
+    if (this.loaded) {
+      return;
+    }
+    this.loaded = true;
+    const refs = this.refs();
+    if (refs.length === 0) {
+      return;
+    }
+    log(`[${this.storageKey}] 加载 ${refs.length} 条手动添加的记录`);
+    const results: Array<T | undefined> = await Promise.all(
+      refs.map(async (ref): Promise<T | undefined> => {
+        try {
+          return await this.fetch(ref);
+        } catch (error) {
+          log(
+            `[${this.storageKey}] id=${ref.id} 加载失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      }),
+    );
+    this.items = results.filter((item): item is T => item !== undefined);
+  }
+
+  /** 添加/置顶一条并持久化；同一 id 只会有一条 */
+  async add(ref: PinnedRef): Promise<T | undefined> {
+    const item = await this.fetch(ref);
+    const refs = this.refs().filter((existing) => existing.id !== ref.id);
+    refs.unshift(ref);
+    await this.memento?.update(this.storageKey, refs);
+
+    this.loaded = true;
+    this.items = [item, ...this.items.filter((existing) => this.idOf(existing) !== ref.id)].filter(
+      (value): value is T => value !== undefined,
+    );
+    return item;
+  }
+
+  async remove(id: number): Promise<void> {
+    await this.memento?.update(
+      this.storageKey,
+      this.refs().filter((ref) => ref.id !== id),
+    );
+    this.items = this.items.filter((item) => this.idOf(item) !== id);
+  }
+
+  private refs(): PinnedRef[] {
+    const raw = this.memento?.get<unknown[]>(this.storageKey) ?? [];
+    return raw.map(normalizeRef).filter((ref): ref is PinnedRef => ref !== undefined);
   }
 }
 

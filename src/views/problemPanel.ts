@@ -110,6 +110,16 @@ const STATUS_TAGS: Record<number, string> = {
   99: "等待中",
 };
 
+/**
+ * webview 脚本里要用到的正则，**必须**以字符串常量的形式放在模板外，再用 JSON.stringify 注进去。
+ *
+ * 模板字符串会把 `\{`、`\s`、`\d` 这类「未知转义」的反斜杠吃掉（`/\s/` 到运行时变成 `/s/`），
+ * 直接写在模板里的正则字面量会静默失效——客观题的选项渲染不出来就是这个原因。
+ */
+const OBJECTIVE_PLACEHOLDER_PATTERN =
+  "\\{\\{\\s*(input|select|multiselect|textarea)\\(\\s*(\\d+(?:-\\d+)?)\\s*\\)\\s*\\}\\}";
+const SAMPLE_LANG_PATTERN = "language-(input|output)(\\d+)";
+
 function statusTag(status?: JudgeStatus | null): string {
   return status?.shortName || STATUS_TAGS[status?.id ?? -1] || status?.name || "未知";
 }
@@ -284,15 +294,33 @@ function buildHtml(problem: ProblemDetail, options: BuildHtmlOptions): string {
   ]
     .filter(Boolean)
     .join("");
-  const limits = oj
-    ? `时间 ${oj.timeLimit}ms · 内存 ${oj.memoryLimit}MB · ${escapeHtml(oj.ioMode?.name ?? "")}`
-    : "";
-  const rate = base.total > 0 ? `${((base.ac / base.total) * 100).toFixed(1)}%` : "-";
-  const kindLabel = kind === "choice" ? "选择题" : kind === "objective" ? "客观题" : "";
-  // 选择题/客观题没有时空限制，那一行就换成题目类型
-  const infoLine = [kindLabel || limits, `通过率 ${rate}（${base.ac}/${base.total}）`]
-    .filter(Boolean)
-    .join(" · ");
+  // 元信息做成卡片：时空限制和文件 IO 是「看错就爆零」的东西，塞在一行灰字里太容易被划过去
+  const cards: Array<{ label: string; value: string; hint?: string; accent?: boolean }> = [];
+  if (kind === "oj" && oj) {
+    cards.push({ label: "时间限制", value: `${oj.timeLimit} ms` });
+    cards.push({ label: "内存限制", value: `${oj.memoryLimit} MB` });
+    cards.push({ label: "输入输出", value: oj.ioMode?.name ?? "-" });
+    // 不能只看文件名：标准 IO 题的 ioReadFileName 也有值（默认 case.in），要靠 ioMode 区分
+    if (oj.ioMode?.id === 2) {
+      cards.push({ label: "读入文件", value: oj.ioReadFileName ?? "-", accent: true });
+      cards.push({ label: "输出文件", value: oj.ioWriteFileName ?? "-", accent: true });
+    }
+  } else {
+    cards.push({ label: "题目类型", value: kind === "choice" ? "选择题" : "客观题" });
+  }
+  cards.push({
+    label: "通过率",
+    value: base.total > 0 ? `${((base.ac / base.total) * 100).toFixed(1)}%` : "-",
+    hint: base.total > 0 ? `${base.ac} / ${base.total}` : undefined,
+  });
+  const infoCards = `<div class="info-cards">${cards
+    .map(
+      (card) => `<div class="info-card${card.accent ? " accent" : ""}">
+    <span class="k">${escapeHtml(card.label)}</span>
+    <span class="v">${escapeHtml(card.value)}${card.hint ? `<small>${escapeHtml(card.hint)}</small>` : ""}</span>
+  </div>`,
+    )
+    .join("")}</div>`;
   // 选择题的选项直接由接口下发；客观题的选项藏在题面 markdown 里，交给脚本按占位符生成
   const choice = problem.problemChoiceDetailVO;
   const multi = choice?.choiceType === 4;
@@ -309,12 +337,6 @@ function buildHtml(problem: ProblemDetail, options: BuildHtmlOptions): string {
 </label>`,
           )
           .join("")}</div>`
-      : "";
-  // 文件 IO 题必须让用户知道程序该读写哪个文件。
-  // 注意不能只看文件名：标准 IO 题的 ioReadFileName 也有值（默认 case.in），要靠 ioMode 区分。
-  const ioFiles =
-    oj && oj.ioMode?.id === 2 && (oj.ioReadFileName || oj.ioWriteFileName)
-      ? `<div class="meta fileio">文件 IO：读 <code>${escapeHtml(oj.ioReadFileName ?? "-")}</code> · 写 <code>${escapeHtml(oj.ioWriteFileName ?? "-")}</code></div>`
       : "";
   // 只有编程题能自测；输入上限与网页端一致（手动输入 1MB）
   const selfTestHtml =
@@ -379,12 +401,57 @@ ${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
   table.cases { border-collapse: collapse; width: 100%; margin-top: 8px; }
   table.cases th, table.cases td { border: 1px solid var(--vscode-panel-border); padding: 3px 8px; text-align: left; }
   table.cases th { background: var(--vscode-editorWidget-background); }
+  /* 题面 markdown 里的表格：只拿到渲染后的 HTML，没有预览用的 CSS，不补样式就是没边框的一坨 */
+  #description table {
+    border-collapse: collapse;
+    margin: 10px 0;
+    max-width: 100%;
+  }
+  #description th, #description td {
+    border: 1px solid var(--vscode-panel-border);
+    padding: 4px 10px;
+    text-align: left;
+  }
+  #description th { background: var(--vscode-editorWidget-background); font-weight: 600; }
+  #description img { max-width: 100%; }
+  /* 样例：输入 / 输出左右并列，窄了就自动换行堆叠 */
+  .sample-pair { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0; }
+  .sample-col { flex: 1 1 260px; min-width: 0; }
+  .sample-title {
+    margin-bottom: 4px;
+    font-size: 0.9em;
+    font-weight: 600;
+    color: var(--vscode-descriptionForeground);
+  }
+  .sample-body { margin: 0; }
+  #description blockquote {
+    margin: 8px 0;
+    padding: 2px 12px;
+    border-left: 3px solid var(--vscode-panel-border);
+    color: var(--vscode-descriptionForeground);
+  }
   .ok { color: #00B42A; font-weight: 600; }
   .bad { color: #FF1D27; font-weight: 600; }
   .muted { color: var(--vscode-descriptionForeground); }
   .accepted { color: #00B42A; }
-  /* 文件 IO 的文件名要一眼看到，写错就整题 0 分 */
-  .fileio { margin-top: 4px; font-weight: 600; color: var(--vscode-textLink-foreground); }
+  /* 题目元信息卡片：时空限制 / IO 方式 / 通过率 */
+  .info-cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 2px; }
+  .info-card {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 96px;
+    padding: 6px 12px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    background: var(--vscode-editorWidget-background);
+  }
+  .info-card .k { font-size: 0.78em; color: var(--vscode-descriptionForeground); }
+  .info-card .v { font-size: 1.1em; font-weight: 600; }
+  .info-card .v small { margin-left: 6px; font-size: 0.72em; font-weight: 400; color: var(--vscode-descriptionForeground); }
+  /* 文件 IO 的文件名写错就整题 0 分，用链接色单独标出来 */
+  .info-card.accent { border-color: var(--vscode-textLink-foreground); }
+  .info-card.accent .v { color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family, monospace); }
   /* 提交记录：默认只露「状态 / 得分 / 时间」一行，展开才看测试点 */
   details.sub {
     border: 1px solid var(--vscode-panel-border);
@@ -472,8 +539,7 @@ ${katexUri ? `<link rel="stylesheet" href="${katexUri}" />` : ""}
   <h1>${escapeHtml(base.problemId)} ${escapeHtml(base.title)} ${accepted ? '<span class="accepted">✓ 已通过</span>' : ""}</h1>
   ${contextHint ? `<div class="meta"><span class="tag ctx">${escapeHtml(contextHint)}</span></div>` : ""}
   <div class="meta">${meta}</div>
-  <div class="meta">${infoLine}</div>
-  ${ioFiles}
+  ${infoCards}
   <div class="toolbar">
     ${
       interactive
@@ -504,37 +570,58 @@ ${selfTestHtml}
    * 这类占位符出题，选项就是紧跟其后的一串列表项。这里把占位符换成真正的作答控件。
    * 单选/多选的选项值取 A、B、C…（与前端 use-mdown-transform 一致）。
    */
-  const PLACEHOLDER = /\{\{\s*(input|select|multiselect|textarea)\(\s*(\d+(?:-\d+)?)\s*\)\s*\}\}/g;
-  const nextList = (el) => {
-    let node = el.nextElementSibling;
-    while (node && node.tagName !== "UL" && !(node.textContent || "").trim()) {
-      node = node.nextElementSibling;
-    }
-    return node && node.tagName === "UL" ? node : null;
-  };
+  const PLACEHOLDER = new RegExp(${JSON.stringify(OBJECTIVE_PLACEHOLDER_PATTERN)}, "g");
+
+  /**
+   * 占位符可能落在任意层级（段落里、列表项里、引用块里），选项列表也未必是它的兄弟节点——
+   * 网站用 md-editor-v3 渲染，插件用 VS Code 的 markdown-it，两套管线的 DOM 结构不保证一致。
+   * 所以这里按文本节点找占位符，选项列表则按文档顺序往后找最近的 <ul>。
+   */
   const fillObjective = (root) => {
     if (!root) return;
-    for (const block of Array.from(root.children)) {
-      if (block.tagName === "PRE") continue; // 代码块里的占位符是示例，不动
+
+    const targets = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      // 代码块里的占位符是示例，不动
+      if (textNode.parentElement && textNode.parentElement.closest("pre")) continue;
       PLACEHOLDER.lastIndex = 0;
-      for (const match of [...block.innerHTML.matchAll(PLACEHOLDER)]) {
+      const matches = [...(textNode.nodeValue || "").matchAll(PLACEHOLDER)];
+      if (matches.length > 0) {
+        targets.push({ node: textNode, matches });
+      }
+    }
+
+    /** 文档顺序里，host 之后最近的那个列表 */
+    const listAfter = (host) => {
+      const all = Array.from(root.querySelectorAll("*"));
+      for (let i = all.indexOf(host) + 1; i < all.length; i++) {
+        if (all[i].tagName === "UL") return all[i];
+      }
+      return null;
+    };
+
+    for (const target of targets) {
+      const host = target.node.parentElement;
+      if (!host) continue;
+      for (const match of target.matches) {
         const [raw, type, id] = match;
         if (type === "input" || type === "textarea") {
-          const tag =
+          const control =
             type === "input"
               ? '<input autocomplete="off" type="text" name="' + id + '" class="objective-input" />'
               : '<textarea autocomplete="off" name="' + id + '" class="objective-input"></textarea>';
-          block.innerHTML = block.innerHTML.replace(raw, '<span id="p' + id + '">' + tag + "</span>");
+          host.innerHTML = host.innerHTML.replace(raw, '<span id="p' + id + '">' + control + "</span>");
           continue;
         }
-        // 单选 / 多选：选项来自紧随其后的列表
-        const list = nextList(block) || (block.parentElement ? nextList(block.parentElement) : null);
+        // 单选 / 多选：选项来自后面那个列表
+        const list = listAfter(host);
         if (!list) continue;
-        block.innerHTML = block.innerHTML.replace(raw, "");
+        host.innerHTML = host.innerHTML.replace(raw, "");
         Array.from(list.querySelectorAll("li")).forEach((li, index) => {
           const label = document.createElement("label");
           label.className = "objective-option";
-          label.id = "p" + id;
           const input = document.createElement("input");
           input.type = type === "select" ? "radio" : "checkbox";
           input.name = id;
@@ -549,6 +636,50 @@ ${selfTestHtml}
     }
   };
   if (KIND === "objective") fillObjective(document.getElementById("description"));
+
+  /**
+   * 样例成对出现（围栏语言标记是 input1 / output1 / input2 / output2），
+   * 渲染出来是上下四块，对照着看要来回滚。这里按语言标记（markdown-it 的
+   * langPrefix 会留下 language-input1）把同一组并成左右两栏，并补上「输入 #1 / 输出 #1」标题。
+   */
+  const SAMPLE_LANG = new RegExp(${JSON.stringify(SAMPLE_LANG_PATTERN)});
+  const sampleInfo = (pre) => {
+    const code = pre.querySelector("code");
+    const raw = ((code && code.className) || "") + " " + (pre.className || "");
+    const matched = SAMPLE_LANG.exec(raw);
+    return matched ? { kind: matched[1], index: matched[2] } : null;
+  };
+  const buildSamples = (root) => {
+    if (!root) return;
+    const blocks = Array.from(root.querySelectorAll("pre")).filter((pre) => sampleInfo(pre));
+    for (let i = 0; i < blocks.length; i++) {
+      const input = blocks[i];
+      const inputInfo = sampleInfo(input);
+      if (!inputInfo || inputInfo.kind !== "input") continue;
+      // 只有紧跟着的那一块是同一组输出时才配对，避免把别的代码块卷进来
+      const output = blocks[i + 1];
+      const outputInfo = output && sampleInfo(output);
+      if (!outputInfo || outputInfo.kind !== "output" || outputInfo.index !== inputInfo.index) continue;
+
+      const pair = document.createElement("div");
+      pair.className = "sample-pair";
+      for (const [block, info] of [[input, inputInfo], [output, outputInfo]]) {
+        const column = document.createElement("div");
+        column.className = "sample-col";
+        const title = document.createElement("div");
+        title.className = "sample-title";
+        title.textContent = (info.kind === "input" ? "输入 #" : "输出 #") + info.index;
+        // 用渲染器给的类名换掉原样式，高亮出来的内层结构保留
+        block.className = "sample-body";
+        column.append(title, block);
+        pair.append(column);
+      }
+      input.replaceWith(pair);
+      output.remove();
+      i += 1; // 输出那块已经并进去了
+    }
+  };
+  buildSamples(document.getElementById("description"));
 
   /** 收集当前作答：客观题按小题号、选择题按选项 id */
   const readAnswers = () => {
@@ -698,7 +829,8 @@ export class ProblemPanel implements vscode.Disposable {
       }
       ProblemPanel.current.pid = pid;
       ProblemPanel.current.context = context;
-      ProblemPanel.current.panel.reveal(vscode.ViewColumn.Active, false);
+      // 不传列 = 留在它原来那一栏，别把它拽到当前焦点所在的编辑器栏里
+      ProblemPanel.current.panel.reveal(undefined, false);
       await ProblemPanel.current.load();
       return ProblemPanel.current;
     }
@@ -708,7 +840,8 @@ export class ProblemPanel implements vscode.Disposable {
     const panel = vscode.window.createWebviewPanel(
       "htoj.problem",
       "题目",
-      vscode.ViewColumn.Active,
+      // 默认开在右侧分屏，左边留给代码
+      vscode.ViewColumn.Beside,
       {
         enableScripts: true,
         retainContextWhenHidden: true,

@@ -103,6 +103,57 @@ function resolveContestArg(arg: unknown): { cid: number; gid?: number } | undefi
   return undefined;
 }
 
+/**
+ * 从比赛链接里解析 cid / gid。
+ * 支持整条链接（`.../contest/detail?cid=123&gid=456`）、参数片段（`cid=123&gid=456`）或纯数字 cid。
+ */
+function parseContestRef(input: string): { cid: number; gid?: number } | undefined {
+  const text = input.trim();
+  const cidText = /[?&#]?cid=(\d+)/.exec(text)?.[1] ?? (/^\d+$/.test(text) ? text : undefined);
+  if (!cidText) {
+    return undefined;
+  }
+  const gidText = /[?&#]?gid=(\d+)/.exec(text)?.[1];
+  return { cid: Number(cidText), gid: gidText ? Number(gidText) : undefined };
+}
+
+/**
+ * 从题目链接解析 pid 和上下文。
+ * 比赛题/题单题/小组题必须把 cid / tid / gid 一起带上，否则后端返回「该题目不可见」。
+ */
+function parseProblemRef(input: string): { pid: number; context?: ProblemContext } | undefined {
+  const text = input.trim();
+  const pidText = /[?&#]?pid=(\d+)/.exec(text)?.[1] ?? (/^\d+$/.test(text) ? text : undefined);
+  if (!pidText) {
+    return undefined;
+  }
+  const context: ProblemContext = {};
+  const cid = /[?&#]?cid=(\d+)/.exec(text)?.[1];
+  const tid = /[?&#]?tid=(\d+)/.exec(text)?.[1];
+  const gid = /[?&#]?gid=(\d+)/.exec(text)?.[1];
+  if (cid) {
+    context.cid = Number(cid);
+  }
+  if (tid) {
+    context.tid = Number(tid);
+  }
+  if (gid) {
+    context.gid = Number(gid);
+  }
+  return { pid: Number(pidText), context: Object.keys(context).length > 0 ? context : undefined };
+}
+
+/** 从题单链接解析 tid / gid（小组题单必须带 gid） */
+function parseTrainingRef(input: string): { tid: number; gid?: number } | undefined {
+  const text = input.trim();
+  const tidText = /[?&#]?tid=(\d+)/.exec(text)?.[1] ?? (/^\d+$/.test(text) ? text : undefined);
+  if (!tidText) {
+    return undefined;
+  }
+  const gidText = /[?&#]?gid=(\d+)/.exec(text)?.[1];
+  return { tid: Number(tidText), gid: gidText ? Number(gidText) : undefined };
+}
+
 /** 解析命令参数里的题单 tid：可能是数字，也可能是题单树的节点对象 */
 function resolveTrainingArg(arg: unknown): number | undefined {
   if (typeof arg === "number") {
@@ -210,9 +261,10 @@ async function pickSubmitEditor(pid?: number): Promise<vscode.TextEditor | undef
 
 export function activate(context: vscode.ExtensionContext): void {
   const session = new Session(context.secrets);
-  const problemTree = new ProblemTreeProvider(session);
-  const trainingTree = new TrainingTreeProvider(session);
-  const contestTree = new ContestTreeProvider(session);
+  // 三个树都支持「按链接手动添加」，需要 globalState 做持久化
+  const problemTree = new ProblemTreeProvider(session, context.globalState);
+  const trainingTree = new TrainingTreeProvider(session, context.globalState);
+  const contestTree = new ContestTreeProvider(session, context.globalState);
 
   log("================ 核桃OJ 扩展已激活 ================");
   log(
@@ -308,19 +360,46 @@ export function activate(context: vscode.ExtensionContext): void {
     if (session.isLoggedIn) {
       return true;
     }
-    void vscode.window
-      .showWarningMessage("请先登录核桃OJ。", "微信扫码登录", "粘贴 Token")
-      .then((choice) => {
-        if (choice === "微信扫码登录") {
-          void vscode.commands.executeCommand("htoj.login");
-        } else if (choice === "粘贴 Token") {
-          void vscode.commands.executeCommand("htoj.loginWithToken");
-        }
-      });
+    void vscode.window.showWarningMessage("请先登录核桃OJ。", "登录").then((choice) => {
+      if (choice === "登录") {
+        void vscode.commands.executeCommand("htoj.login");
+      }
+    });
     return false;
   };
 
-  const doLogin = async (): Promise<void> => {
+  /**
+   * 统一登录入口：先让用户挑登录方式，再转给对应的具体命令。
+   * 侧边栏欢迎语、状态栏菜单、requireLogin 的提示、题目列表的「重新登录」都走这里，
+   * 新增登录方式时只改这一处 + 一个命令。
+   */
+  const doLoginMenu = async (): Promise<void> => {
+    const picked = await vscode.window.showQuickPick(
+      [
+        {
+          label: "$(device-mobile) 微信扫码登录",
+          description: "手机扫码并在微信里确认，最省事",
+          value: "htoj.loginByQr",
+        },
+        {
+          label: "$(key) 手机号 + 密码登录",
+          description: "需要账号已设置密码",
+          value: "htoj.loginByPassword",
+        },
+        {
+          label: "$(clippy) 粘贴 Token 登录",
+          description: "从浏览器 DevTools 复制 KEY_USER_LOGIN_TOKEN",
+          value: "htoj.loginWithToken",
+        },
+      ],
+      { title: "登录核桃OJ", placeHolder: "选择登录方式" },
+    );
+    if (picked) {
+      await vscode.commands.executeCommand(picked.value);
+    }
+  };
+
+  const doLoginByQr = async (): Promise<void> => {
     const token = await showQrLoginPanel(session, context.extensionUri);
     if (!token) {
       return;
@@ -828,7 +907,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const register = (id: string, handler: (...args: never[]) => unknown) =>
     context.subscriptions.push(vscode.commands.registerCommand(id, handler));
 
-  register("htoj.login", doLogin);
+  register("htoj.login", doLoginMenu);
+  register("htoj.loginByQr", doLoginByQr);
   register("htoj.loginWithToken", doLoginWithToken);
   register("htoj.loginByPassword", doLoginByPassword);
 
@@ -1038,6 +1118,160 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
+  /**
+   * 用比赛链接把比赛钉进列表。
+   * 带 gid 的小组赛不会出现在 get-contest-list 里（接口不支持按 gid 过滤），只能自己加。
+   */
+  register("htoj.addContest", async () => {
+    if (!requireLogin()) {
+      return;
+    }
+    const input = await vscode.window.showInputBox({
+      title: "添加比赛",
+      prompt: "粘贴比赛链接；带 gid 的小组赛要把 gid 一起带上",
+      placeHolder: "https://htoj.com.cn/cpp/oj/contest/detail?cid=22921376372096&gid=123",
+      ignoreFocusOut: true,
+      validateInput: (value) => (parseContestRef(value) ? undefined : "没识别出 cid，检查一下链接"),
+    });
+    if (!input) {
+      return;
+    }
+    const ref = parseContestRef(input);
+    if (!ref) {
+      return;
+    }
+    log(`[比赛] 添加 cid=${ref.cid} gid=${ref.gid ?? "无"}`);
+    try {
+      const info = await contestTree.addPinned(ref.cid, ref.gid);
+      void vscode.window.showInformationMessage(`已添加「${info?.title ?? ref.cid}」到比赛列表。`);
+    } catch (error) {
+      logError("[比赛] 添加失败", error);
+      void vscode.window.showErrorMessage(`添加比赛失败：${errorMessage(error)}`);
+    }
+  });
+
+  /** 移除手动添加的比赛（只影响插件列表） */
+  register("htoj.removeContest", async (arg?: unknown) => {
+    const target = resolveContestArg(arg);
+    if (!target) {
+      void vscode.window.showWarningMessage("无法确定要移除哪场比赛。");
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      "从比赛列表里移除这场？",
+      { modal: true, detail: "只影响插件里的「已添加的比赛」，网页端不受影响。" },
+      "移除",
+    );
+    if (confirmed !== "移除") {
+      return;
+    }
+    await contestTree.removePinned(target.cid);
+    log(`[比赛] 已移除 cid=${target.cid}`);
+  });
+
+  /**
+   * 用题目链接把题目钉进列表。
+   * 小组题、比赛题这类在题目列表里翻不到；链接里带的 cid / tid / gid 会一起记住，
+   * 否则点进去是「该题目不可见」。
+   */
+  register("htoj.addProblem", async () => {
+    if (!requireLogin()) {
+      return;
+    }
+    const input = await vscode.window.showInputBox({
+      title: "添加题目",
+      prompt: "粘贴题目链接；比赛题 / 题单题 / 小组题要把 cid、tid、gid 一起带上",
+      placeHolder: "https://htoj.com.cn/cpp/oj/problem/detail?pid=22169438826624",
+      ignoreFocusOut: true,
+      validateInput: (value) => (parseProblemRef(value) ? undefined : "没识别出 pid，检查一下链接"),
+    });
+    if (!input) {
+      return;
+    }
+    const ref = parseProblemRef(input);
+    if (!ref) {
+      return;
+    }
+    log(
+      `[题目] 添加 pid=${ref.pid}`,
+      ref.context ? `上下文=${JSON.stringify(ref.context)}` : "无上下文",
+    );
+    try {
+      const item = await problemTree.addPinned(ref.pid, ref.context);
+      void vscode.window.showInformationMessage(
+        `已添加「${item?.problemId ?? ref.pid} ${item?.title ?? ""}」到题目列表。`.trim(),
+      );
+    } catch (error) {
+      logError("[题目] 添加失败", error);
+      void vscode.window.showErrorMessage(`添加题目失败：${errorMessage(error)}`);
+    }
+  });
+
+  register("htoj.removeProblem", async (arg?: unknown) => {
+    const target = resolveProblemArg(arg);
+    if (!target) {
+      void vscode.window.showWarningMessage("无法确定要移除哪道题。");
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      "从题目列表里移除这道题？",
+      { modal: true, detail: "只影响插件里的「已添加的题目」，网页端不受影响。" },
+      "移除",
+    );
+    if (confirmed !== "移除") {
+      return;
+    }
+    await problemTree.removePinned(target.pid);
+    log(`[题目] 已移除 pid=${target.pid}`);
+  });
+
+  /** 用题单链接把题单钉进列表（小组题单不在 get-training-list 里） */
+  register("htoj.addTraining", async () => {
+    if (!requireLogin()) {
+      return;
+    }
+    const input = await vscode.window.showInputBox({
+      title: "添加题单",
+      prompt: "粘贴题单链接；小组题单要把 gid 一起带上",
+      placeHolder: "https://htoj.com.cn/cpp/oj/training/detail?tid=22338793157760&gid=123",
+      ignoreFocusOut: true,
+      validateInput: (value) => (parseTrainingRef(value) ? undefined : "没识别出 tid，检查一下链接"),
+    });
+    if (!input) {
+      return;
+    }
+    const ref = parseTrainingRef(input);
+    if (!ref) {
+      return;
+    }
+    log(`[题单] 添加 tid=${ref.tid} gid=${ref.gid ?? "无"}`);
+    try {
+      const item = await trainingTree.addPinned(ref.tid, ref.gid);
+      void vscode.window.showInformationMessage(`已添加题单「${item?.title ?? ref.tid}」。`);
+    } catch (error) {
+      logError("[题单] 添加失败", error);
+      void vscode.window.showErrorMessage(`添加题单失败：${errorMessage(error)}`);
+    }
+  });
+
+  register("htoj.removeTraining", async (arg?: unknown) => {
+    const tid = resolveTrainingArg(arg);
+    if (!tid) {
+      void vscode.window.showWarningMessage("无法确定要移除哪个题单。");
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      "从题单列表里移除这个题单？",
+      { modal: true, detail: "只影响插件里的「已添加的题单」，网页端不受影响。" },
+      "移除",
+    );
+    if (confirmed !== "移除") {
+      return;
+    }
+    await trainingTree.removePinned(tid);
+    log(`[题单] 已移除 tid=${tid}`);
+  });
+
   /** 开始练习（参加题单）：成功后刷新该题单的题目 */
   register("htoj.joinTraining", async (arg?: unknown) => {
     if (!requireLogin()) {
@@ -1157,15 +1391,7 @@ export function activate(context: vscode.ExtensionContext): void {
       items.push({ label: "$(account) 已登录：点击查看操作", run: () => {} });
       items.push({ label: "$(sign-out) 退出登录", run: () => void vscode.commands.executeCommand("htoj.logout") });
     } else {
-      items.push({ label: "$(sign-in) 微信扫码登录", run: () => void vscode.commands.executeCommand("htoj.login") });
-      items.push({
-        label: "$(key) 手机号 + 密码登录",
-        run: () => void vscode.commands.executeCommand("htoj.loginByPassword"),
-      });
-      items.push({
-        label: "$(clippy) 粘贴 Token 登录",
-        run: () => void vscode.commands.executeCommand("htoj.loginWithToken"),
-      });
+      items.push({ label: "$(sign-in) 登录", run: () => void vscode.commands.executeCommand("htoj.login") });
     }
     items.push({
       label: "$(globe) 切换题库语言",

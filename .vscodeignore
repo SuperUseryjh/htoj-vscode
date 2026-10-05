@@ -14,6 +14,10 @@ bun.lock
 bun.lockb
 package-lock.json
 **/*.map
+# vsce 只自动排除 *.vsix，换成 .zip 之类的会被打进包里
+*.zip
+# 根目录临时导出的 html（调试用）也不该进包
+*.html
 .gitignore
 .gitattributes
 docs/

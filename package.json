@@ -2,7 +2,7 @@
   "name": "htoj-vscode",
   "displayName": "核桃 OJ",
   "description": "在 VSCode 里刷核桃OJ：浏览题目/题单/比赛，本地写代码，一键提交并查看评测结果。",
-  "version": "1.1.1",
+  "version": "1.1.3",
   "publisher": "YaoOnion",
   "license": "GPL-3.0-only",
   "engines": {
@@ -45,23 +45,28 @@
     "viewsWelcome": [
       {
         "view": "htoj.problems",
-        "contents": "登录后即可浏览题目。\n[微信扫码登录](command:htoj.login)\n[粘贴 Token](command:htoj.loginWithToken)"
+        "contents": "登录后即可浏览题目。\n[登录](command:htoj.login)"
       },
       {
         "view": "htoj.trainings",
-        "contents": "登录后即可浏览题单。\n[微信扫码登录](command:htoj.login)"
+        "contents": "登录后即可浏览题单。\n[登录](command:htoj.login)"
       },
       {
         "view": "htoj.contests",
-        "contents": "登录后即可浏览比赛。\n[微信扫码登录](command:htoj.login)"
+        "contents": "登录后即可浏览比赛。\n[登录](command:htoj.login)"
       }
     ],
     "commands": [
       {
         "command": "htoj.login",
-        "title": "登录（微信扫码）",
+        "title": "登录",
         "category": "核桃OJ",
         "icon": "$(sign-in)"
+      },
+      {
+        "command": "htoj.loginByQr",
+        "title": "登录（微信扫码）",
+        "category": "核桃OJ"
       },
       {
         "command": "htoj.loginByPassword",
@@ -129,6 +134,42 @@
         "title": "开始比赛",
         "category": "核桃OJ",
         "icon": "$(play)"
+      },
+      {
+        "command": "htoj.addProblem",
+        "title": "添加题目（粘贴链接）",
+        "category": "核桃OJ",
+        "icon": "$(add)"
+      },
+      {
+        "command": "htoj.removeProblem",
+        "title": "移除已添加的题目",
+        "category": "核桃OJ",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "htoj.addTraining",
+        "title": "添加题单（粘贴链接）",
+        "category": "核桃OJ",
+        "icon": "$(add)"
+      },
+      {
+        "command": "htoj.removeTraining",
+        "title": "移除已添加的题单",
+        "category": "核桃OJ",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "htoj.addContest",
+        "title": "添加比赛（粘贴链接）",
+        "category": "核桃OJ",
+        "icon": "$(add)"
+      },
+      {
+        "command": "htoj.removeContest",
+        "title": "移除已添加的比赛",
+        "category": "核桃OJ",
+        "icon": "$(trash)"
       },
       {
         "command": "htoj.joinTraining",
@@ -206,6 +247,21 @@
           "command": "htoj.switchZone",
           "when": "view =~ /htoj\\.(problems|trainings|contests)/",
           "group": "navigation@4"
+        },
+        {
+          "command": "htoj.addProblem",
+          "when": "view == htoj.problems",
+          "group": "navigation@5"
+        },
+        {
+          "command": "htoj.addTraining",
+          "when": "view == htoj.trainings",
+          "group": "navigation@5"
+        },
+        {
+          "command": "htoj.addContest",
+          "when": "view == htoj.contests",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
@@ -230,19 +286,34 @@
           "group": "2_track@1"
         },
         {
+          "command": "htoj.removeContest",
+          "when": "view == htoj.contests && viewItem == htoj.contestPinned",
+          "group": "2_track@2"
+        },
+        {
           "command": "htoj.joinTraining",
-          "when": "view == htoj.trainings && viewItem == htoj.training.unattended",
+          "when": "view == htoj.trainings && viewItem =~ /htoj\\.training(Pinned)?\\.unattended/",
           "group": "inline@0"
         },
         {
+          "command": "htoj.removeTraining",
+          "when": "view == htoj.trainings && viewItem =~ /htoj\\.trainingPinned/",
+          "group": "2_track@2"
+        },
+        {
           "command": "htoj.newCodeFile",
-          "when": "view =~ /htoj\\.(problems|trainings|contests)/ && viewItem == htoj.problem",
+          "when": "view =~ /htoj\\.(problems|trainings|contests)/ && viewItem =~ /htoj\\.problem/",
           "group": "inline@1"
         },
         {
           "command": "htoj.openInBrowser",
-          "when": "view =~ /htoj\\.(problems|trainings|contests)/ && viewItem == htoj.problem",
+          "when": "view =~ /htoj\\.(problems|trainings|contests)/ && viewItem =~ /htoj\\.problem/",
           "group": "inline@2"
+        },
+        {
+          "command": "htoj.removeProblem",
+          "when": "view == htoj.problems && viewItem == htoj.problemPinned",
+          "group": "2_track@2"
         }
       ],
       "editor/context": [
@@ -256,6 +327,30 @@
         {
           "command": "htoj.clearSearch",
           "when": "htoj.hasSearch"
+        },
+        {
+          "command": "htoj.loginByQr",
+          "when": "false"
+        },
+        {
+          "command": "htoj.loginByPassword",
+          "when": "false"
+        },
+        {
+          "command": "htoj.loginWithToken",
+          "when": "false"
+        },
+        {
+          "command": "htoj.removeContest",
+          "when": "false"
+        },
+        {
+          "command": "htoj.removeProblem",
+          "when": "false"
+        },
+        {
+          "command": "htoj.removeTraining",
+          "when": "false"
         },
         {
           "command": "htoj.joinContest",

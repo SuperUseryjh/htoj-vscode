@@ -11,14 +11,22 @@ import {
   messageItem,
   moreItem,
   PageState,
+  PINNED_GROUP_LABEL,
+  type PinnedRef,
+  PinnedStore,
   problemTreeItem,
 } from "./common";
 
 export const TRAINING_VIEW_ID = "trainings";
 
+/** 「手动添加的题单」持久化用的 key（值是一组 PinnedRef，id 为 tid） */
+const PINNED_KEY = "htoj.pinnedTrainings";
+
 /** 题单树的节点类型（题单与题目是两类节点，必须区分开） */
 export type TrainingNode =
-  | { kind: "training"; value: TrainingItem; key: string }
+  | { kind: "training"; value: TrainingItem; key: string; pinned?: boolean }
+  /** 「已添加的题单」分组标题，只在有内容时出现 */
+  | { kind: "pinned" }
   | { kind: "chapter"; label: string; key: string }
   | { kind: "problem"; value: ProblemListItem; key: string; context: ProblemContext }
   | { kind: "join"; tid: number; key: string }
@@ -37,20 +45,78 @@ export class TrainingTreeProvider implements vscode.TreeDataProvider<TrainingNod
   private readonly state = new PageState<TrainingItem>(pageSize());
   private readonly children = new Map<number, TrainingNode[]>();
   private readonly loadingChildren = new Set<number>();
+  /** 手动添加的题单（小组题单之类列表里翻不到的） */
+  private readonly pinned: PinnedStore<TrainingItem>;
+  /**
+   * 手动添加的题单如果是小组题单，得把 gid 记下来。
+   * TrainingItem 里没有 gid 字段，而拿题目、交题目都要靠它。
+   */
+  private readonly pinnedGid = new Map<number, number>();
 
-  constructor(private readonly session: Session) {}
+  constructor(
+    private readonly session: Session,
+    memento?: vscode.Memento,
+  ) {
+    this.pinned = new PinnedStore<TrainingItem>(
+      PINNED_KEY,
+      memento,
+      (item) => item.id,
+      async (ref) => this.fetchTraining(ref),
+    );
+  }
+
+  private async fetchTraining(ref: PinnedRef): Promise<TrainingItem> {
+    const gid = ref.extra?.gid;
+    if (gid) {
+      this.pinnedGid.set(ref.id, gid);
+    }
+    return training.detail(this.session.client, { tid: ref.id, gid });
+  }
 
   refresh(): void {
     this.state.reset();
     this.state.pageSize = pageSize();
     this.children.clear();
     this.loadingChildren.clear();
+    this.pinned.invalidate();
+    this.pinnedGid.clear();
+    this.emitter.fire();
+  }
+
+  /** 列表里的和手动添加的一起算 */
+  private findTraining(tid: number): TrainingItem | undefined {
+    return this.pinned.find(tid) ?? this.state.items.find((item) => item.id === tid);
+  }
+
+  async loadPinned(): Promise<void> {
+    if (!this.session.isLoggedIn || this.pinned.isLoaded) {
+      return;
+    }
+    await this.pinned.load();
+    this.emitter.fire();
+  }
+
+  /** 按链接添加一个题单；同一 tid 重复添加只会刷新顺序 */
+  async addPinned(tid: number, gid?: number): Promise<TrainingItem | undefined> {
+    const item = await this.pinned.add({ id: tid, extra: gid ? { gid } : undefined });
+    if (gid) {
+      this.pinnedGid.set(tid, gid);
+    }
+    this.children.delete(tid);
+    this.emitter.fire();
+    return item;
+  }
+
+  async removePinned(tid: number): Promise<void> {
+    await this.pinned.remove(tid);
+    this.pinnedGid.delete(tid);
+    this.children.delete(tid);
     this.emitter.fire();
   }
 
   /** 参加成功后就地更新状态并清掉子节点缓存，重新展开时会按已参加重新加载 */
   markAttended(tid: number): void {
-    const record = this.state.items.find((item) => item.id === tid);
+    const record = this.findTraining(tid);
     if (record) {
       record.isAttend = true;
     }
@@ -81,6 +147,18 @@ export class TrainingTreeProvider implements vscode.TreeDataProvider<TrainingNod
 
   getTreeItem(node: TrainingNode): vscode.TreeItem {
     switch (node.kind) {
+      case "pinned": {
+        const item = new vscode.TreeItem(
+          `${PINNED_GROUP_LABEL}的题单`,
+          vscode.TreeItemCollapsibleState.Expanded,
+        );
+        item.description = `${this.pinned.list.length} 个`;
+        item.iconPath = new vscode.ThemeIcon("pin");
+        item.tooltip = new vscode.MarkdownString(
+          "通过题单链接手动添加的题单。\n\n_右键可以移除；小组题单这类在列表里翻不到的可以这样加。_",
+        );
+        return item;
+      }
       case "join":
         return actionItem(
           "开始练习（参加该题单）",
@@ -113,8 +191,13 @@ export class TrainingTreeProvider implements vscode.TreeDataProvider<TrainingNod
             .filter(Boolean)
             .join("\n"),
         );
-        // 用 contextValue 区分参与状态，右键菜单据此决定是否显示「开始练习」
-        item.contextValue = record.isAttend ? "htoj.training" : "htoj.training.unattended";
+        // contextValue 决定右键菜单：参与状态 + 是否手动添加，两段都要带上，
+        // 缺了哪段都会丢菜单（未参与时要能「开始练习」，手动添加的要能「移除」）
+        if (node.pinned) {
+          item.contextValue = record.isAttend ? "htoj.trainingPinned" : "htoj.trainingPinned.unattended";
+        } else {
+          item.contextValue = record.isAttend ? "htoj.training" : "htoj.training.unattended";
+        }
         return item;
       }
       case "chapter": {
@@ -134,27 +217,48 @@ export class TrainingTreeProvider implements vscode.TreeDataProvider<TrainingNod
 
   getChildren(node?: TrainingNode): TrainingNode[] {
     if (node) {
+      if (node.kind === "pinned") {
+        return this.pinned.list.map((value) => ({
+          kind: "training" as const,
+          value,
+          key: `pinned-${value.id}`,
+          pinned: true,
+        }));
+      }
       return node.kind === "training" ? this.childrenOf(node.value) : [];
     }
     logViewState("题单", this.state, `loggedIn=${this.session.isLoggedIn}`);
     if (!this.session.isLoggedIn) {
       return [];
     }
+    if (!this.pinned.isLoaded) {
+      void this.loadPinned();
+    }
+
+    const nodes: TrainingNode[] = [];
+    // 「已添加的题单」固定排在最前面；没有内容时整个分组不出现
+    if (this.pinned.list.length > 0) {
+      nodes.push({ kind: "pinned" });
+    }
     if (this.state.isEmpty) {
       if (this.state.error) {
-        return [{ kind: "message", text: `加载失败：${this.state.error}`, icon: "error" }];
+        nodes.push({ kind: "message", text: `加载失败：${this.state.error}`, icon: "error" });
+        return nodes;
       }
       if (!this.state.loading) {
         void this.loadMore();
       }
-      return [{ kind: "message", text: LOADING_ROOT_TEXT, icon: "loading~spin" }];
+      nodes.push({ kind: "message", text: LOADING_ROOT_TEXT, icon: "loading~spin" });
+      return nodes;
     }
 
-    const nodes: TrainingNode[] = this.state.items.map((value) => ({
-      kind: "training" as const,
-      value,
-      key: String(value.id),
-    }));
+    nodes.push(
+      ...this.state.items.map((value) => ({
+        kind: "training" as const,
+        value,
+        key: String(value.id),
+      })),
+    );
     if (this.state.hasMore) {
       nodes.push({ kind: "more" });
     }
@@ -174,16 +278,19 @@ export class TrainingTreeProvider implements vscode.TreeDataProvider<TrainingNod
 
   private async loadTrainingProblems(item: TrainingItem): Promise<void> {
     this.loadingChildren.add(item.id);
-    log(`[题单] 展开「${item.title}」(tid=${item.id})，加载题目中…`);
+    // 小组题单必须带 gid，否则返回的题目点进去是「该题目不可见」
+    const gid = this.pinnedGid.get(item.id);
+    log(`[题单] 展开「${item.title}」(tid=${item.id} gid=${gid ?? "无"})，加载题目中…`);
     try {
       const result = await training.problems(this.session.client, {
         tid: item.id,
+        gid,
         currentPage: 1,
         limit: 200,
       });
       const collected: TrainingNode[] = [];
       // 从题单里打开题目时带上 tid，提交才会归属到该题单
-      const context: ProblemContext = { tid: item.id };
+      const context: ProblemContext = gid ? { tid: item.id, gid } : { tid: item.id };
       for (const chapter of result.records) {
         const problems = chapter.problemVOList ?? [];
         if (chapter.trainingChapterVO?.title) {
