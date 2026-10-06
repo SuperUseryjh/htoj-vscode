@@ -9,8 +9,12 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname.replace(/^\//, "");
+// 别用 new URL(...).pathname 再手动删开头的斜杠：在 Linux 上那是绝对路径的根，
+// 删掉就变成相对路径了（Windows 上是 /D:/... 才恰好能用）。fileURLToPath 才是跨平台正解。
+const root = fileURLToPath(new URL("..", import.meta.url));
 const FILES = ["src/views/problemPanel.ts", "src/views/loginPanel.ts"];
 
 /** 模板字符串里合法的转义（其余的都是被吃掉的反斜杠） */
@@ -21,7 +25,7 @@ describe("webview 模板", () => {
     const problems: string[] = [];
 
     for (const file of FILES) {
-      const source = readFileSync(`${root}/${file}`, "utf8");
+      const source = readFileSync(join(root, file), "utf8");
       const blocks = [...source.matchAll(/<script[^>]*>\n([\s\S]*?)<\/script>/g)];
       if (blocks.length === 0) {
         problems.push(`${file}：没找到 <script> 块，检查用的标记可能变了`);
@@ -42,7 +46,7 @@ describe("webview 模板", () => {
   });
 
   test("正则通过 JSON.stringify 注入，而不是写成正则字面量", () => {
-    const source = readFileSync(`${root}/src/views/problemPanel.ts`, "utf8");
+    const source = readFileSync(join(root, "src/views/problemPanel.ts"), "utf8");
     const start = source.indexOf('<script nonce="${nonce}">');
     expect(start).toBeGreaterThan(-1);
     const body = source.slice(start, source.indexOf("</script>", start));
