@@ -44,6 +44,11 @@ export interface ClientDeps {
   getZone: () => string;
   /** 站点网关地址，可在设置里修改 */
   getApiBase?: () => string;
+  /**
+   * 带登录态的请求发出前调用，用来保证 token 还没过期（例如用保存的密码静默续期）。
+   * 只在 siteScoped 请求上触发，登录接口本身是 siteScoped=false，不会被它拦住。
+   */
+  beforeRequest?: () => Promise<void>;
   /** 日志输出（注入以便在非 VSCode 环境下复用本模块） */
   log?: (message: string) => void;
 }
@@ -114,6 +119,12 @@ export class HtojClient {
     } = options;
 
     const url = buildUrl(base ?? this.apiBase, path, query);
+
+    // 续期要在取 token 之前完成，否则这次请求带出去的还是旧 token
+    if (siteScoped && this.deps.beforeRequest) {
+      await this.deps.beforeRequest();
+    }
+
     const token = this.deps.getToken();
 
     const headers: Record<string, string> = {

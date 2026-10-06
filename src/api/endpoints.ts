@@ -189,9 +189,12 @@ export const problem = {
 
   submissionList(
     client: HtojClient,
-    query: { currentPage?: number; limit?: number; pid?: number; cid?: number; tid?: number; gid?: number },
+    query: { currentPage?: number; limit?: number; pid?: number; cid?: number; tid?: number },
   ) {
     const { limit, ...rest } = query;
+    // 比赛题的提交记录里 gid 常常是 0（以个人身份提交），拿链接里的 gid 去过滤会一条都查不到：
+    // 实测 pid+cid 有记录，加上 gid 后 total 直接变 0。调用方展开传进来也在这里丢掉。
+    delete (rest as { gid?: unknown }).gid;
     return client.get<Pagination<SubmissionRecord>>(
       "/api/code-community/api/get-my-submission-list",
       // 后端硬限制每页最多 20 条，传大了直接 errCode 401「每页最多显示20条记录」

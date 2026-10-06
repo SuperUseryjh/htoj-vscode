@@ -454,7 +454,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     try {
       const user = await session.loginByPassword(phoneNumber.trim(), password);
-      void vscode.window.showInformationMessage(`登录成功，欢迎 ${user.nickname || user.username}！`);
+      void vscode.window.showInformationMessage(
+        `登录成功，欢迎 ${user.nickname || user.username}！（token 过期会用保存的密码自动续期，退出登录可清除）`,
+      );
     } catch (error) {
       void vscode.window.showErrorMessage(`登录失败：${errorMessage(error)}`);
     }

@@ -50,9 +50,10 @@ jobs:
       - name: 跑测试
         run: bun test
 
+      # --readme-path：市场页面用 README.plugin.md（README.md 是给仓库看的开发说明）
       - name: 打包 vsix
         run: |
-          npx --yes @vscode/vsce@4 package --no-dependencies
+          npx --yes @vscode/vsce@4 package --no-dependencies --readme-path README.plugin.md
           ls -lh ./*.vsix
 
       - name: 上传构建产物

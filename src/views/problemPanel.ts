@@ -635,7 +635,6 @@ ${selfTestHtml}
       }
     }
   };
-  if (KIND === "objective") fillObjective(document.getElementById("description"));
 
   /**
    * 样例成对出现（围栏语言标记是 input1 / output1 / input2 / output2），
@@ -663,23 +662,28 @@ ${selfTestHtml}
 
       const pair = document.createElement("div");
       pair.className = "sample-pair";
-      for (const [block, info] of [[input, inputInfo], [output, outputInfo]]) {
-        const column = document.createElement("div");
-        column.className = "sample-col";
+      const inputCol = document.createElement("div");
+      inputCol.className = "sample-col";
+      const outputCol = document.createElement("div");
+      outputCol.className = "sample-col";
+      // 先把容器插回文档，再把两个块挪进去。反过来写（先 append 块、后 replaceWith）会让容器
+      // 变成自己的后代，抛 HierarchyRequestError，样例会整段消失
+      input.replaceWith(pair);
+      pair.append(inputCol, outputCol);
+      for (const [column, block, info] of [
+        [inputCol, input, inputInfo],
+        [outputCol, output, outputInfo],
+      ]) {
         const title = document.createElement("div");
         title.className = "sample-title";
         title.textContent = (info.kind === "input" ? "输入 #" : "输出 #") + info.index;
         // 用渲染器给的类名换掉原样式，高亮出来的内层结构保留
         block.className = "sample-body";
         column.append(title, block);
-        pair.append(column);
       }
-      input.replaceWith(pair);
-      output.remove();
       i += 1; // 输出那块已经并进去了
     }
   };
-  buildSamples(document.getElementById("description"));
 
   /** 收集当前作答：客观题按小题号、选择题按选项 id */
   const readAnswers = () => {
@@ -772,6 +776,17 @@ ${selfTestHtml}
       document.querySelectorAll("button").forEach((btn) => (btn.disabled = message.value));
     }
   });
+
+  // --- 渲染后的 DOM 后处理 -------------------------------------------------
+  // 放在所有监听注册完之后再执行：这类操作一旦抛异常会中断整段脚本，按钮、提交记录、
+  // 自测就全都失效（样例配对就踩过这个坑），所以这里兜住，失败了也保面板可用。
+  try {
+    const description = document.getElementById("description");
+    if (KIND === "objective") fillObjective(description);
+    buildSamples(description);
+  } catch (error) {
+    console.error("[htoj] 题面后处理失败：", error);
+  }
 </script>
 </body>
 </html>`;
@@ -936,7 +951,9 @@ export class ProblemPanel implements vscode.Disposable {
       const result = await problemApi.submissionList(this.deps.session.client, {
         pid,
         limit: 20,
-        ...this.context,
+        // 注意：不要带 gid，见 submissionList 里的说明
+        cid: this.context?.cid,
+        tid: this.context?.tid,
       });
       if (pid !== this.pid) {
         return; // 期间切了题目，丢弃这次结果

@@ -16,6 +16,10 @@ package-lock.json
 **/*.map
 # vsce 只自动排除 *.vsix，换成 .zip 之类的会被打进包里
 *.zip
+# README.md 是给仓库看的开发说明；市场页面用 README.plugin.md（打包时 --readme-path 指定）。
+# 不排除的话 vsce 会把两个文件都放进包，变成 extension/README.md 与 extension/readme.md，
+# 大小写不敏感路径冲突，打包直接失败。
+README.md
 # 根目录临时导出的 html（调试用）也不该进包
 *.html
 .gitignore
