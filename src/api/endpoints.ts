@@ -53,7 +53,7 @@ export const auth = {
 
   /**
    * 短信验证码登录（第二步）。
-   * 第一步「发送验证码」需要腾讯验证码票据，插件内无法生成，故不提供发送能力。
+   * 第一步「发送验证码」见 sendVerifyCode，需要腾讯验证码票据。
    */
   loginByVerifyCode(
     client: HtojClient,
@@ -68,6 +68,34 @@ export const auth = {
         verifyCode: params.verifyCode,
         countryCode: params.countryCode ?? "86",
         short: params.short ?? "CN",
+      },
+    });
+  },
+
+  /**
+   * 发送短信验证码（登录第一步）。
+   * 必须带腾讯 TCaptcha 票据：ticket / randstr 由 webview 里弹出的腾讯验证码在
+   * 用户完成拖动后回调给出（SDK 与 appid 见 re/src/.../utils/constant.ts）。
+   *
+   * 注意：auth 文档提到前端源码注释里这一步用的是 parentApp / android / 2.0.3 那套头，
+   * 这里先按其余登录接口一致用 htojWeb / web / 1.0.0；若实测报参数类错误再换。
+   */
+  sendVerifyCode(
+    client: HtojClient,
+    params: { phoneNumber: string; ticket: string; randstr: string; countryCode?: string },
+  ) {
+    return client.post<unknown>("/login/v3/account/oauth/verifyCode/htojWeb:Login", {
+      base: HETAO_API_BASE,
+      siteScoped: false,
+      headers: { app_id: "com.hetao101.oj", HT_PLATFORM: "htojWeb", HT_SYSTEM: "web", HT_VERSION: "1.0.0" },
+      body: {
+        checkType: 1,
+        platform: "htojWeb",
+        clientName: "htojWeb",
+        countryCode: params.countryCode ?? "86",
+        phoneNumber: encodeCredential(params.phoneNumber),
+        ticket: params.ticket,
+        randstr: params.randstr,
       },
     });
   },

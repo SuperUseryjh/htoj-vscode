@@ -3,7 +3,6 @@ dist/
 out/
 *.vsix
 .vscode-test/
-docs/
 
 # 逆向工作产物（反编译源码、探针脚本、样本），不属于插件本体
 re/

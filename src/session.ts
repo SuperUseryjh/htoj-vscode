@@ -252,7 +252,16 @@ export class Session implements vscode.Disposable {
     return info;
   }
 
-  /** 短信验证码登录（验证码需自行通过官方渠道获取） */
+  /**
+   * 发送短信验证码（登录第一步）。
+   * ticket / randstr 来自 webview 里弹出的腾讯验证码回调（见 views/loginPanel.ts）。
+   * 票据是一次性的，拿到后要立刻用掉。
+   */
+  async sendVerifyCode(phoneNumber: string, ticket: string, randstr: string): Promise<void> {
+    await auth.sendVerifyCode(this.client, { phoneNumber, ticket, randstr });
+  }
+
+  /** 短信验证码登录（第二步）。验证码由 sendVerifyCode 触发短信后用户自行输入。 */
   async loginByVerifyCode(phoneNumber: string, verifyCode: string): Promise<UserInfo> {
     const result = await auth.loginByVerifyCode(this.client, { phoneNumber, verifyCode });
     return this.loginWithToken(result.token);

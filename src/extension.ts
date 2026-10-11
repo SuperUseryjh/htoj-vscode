@@ -8,7 +8,7 @@ import { Session } from "./session";
 import { getChannel, log, logError } from "./util/logger";
 import { ContestTreeProvider } from "./views/contestTree";
 import { ProblemPanel } from "./views/problemPanel";
-import { showQrLoginPanel } from "./views/loginPanel";
+import { showQrLoginPanel, showSmsLoginPanel } from "./views/loginPanel";
 import { ProblemTreeProvider } from "./views/problemTree";
 import { TrainingTreeProvider } from "./views/trainingTree";
 
@@ -387,6 +387,11 @@ export function activate(context: vscode.ExtensionContext): void {
           value: "htoj.loginByPassword",
         },
         {
+          label: "$(comment) 手机号 + 短信验证码登录",
+          description: "需要拖动完成腾讯验证码后收短信",
+          value: "htoj.loginBySms",
+        },
+        {
           label: "$(clippy) 粘贴 Token 登录",
           description: "从浏览器 DevTools 复制 KEY_USER_LOGIN_TOKEN",
           value: "htoj.loginWithToken",
@@ -410,6 +415,14 @@ export function activate(context: vscode.ExtensionContext): void {
     } catch (error) {
       void vscode.window.showErrorMessage(`登录失败：${errorMessage(error)}`);
     }
+  };
+
+  const doLoginBySms = async (): Promise<void> => {
+    const user = await showSmsLoginPanel(session, context.extensionUri);
+    if (!user) {
+      return;
+    }
+    void vscode.window.showInformationMessage(`登录成功，欢迎 ${user.nickname || user.username}！`);
   };
 
   const doLoginWithToken = async (): Promise<void> => {
@@ -913,6 +926,7 @@ export function activate(context: vscode.ExtensionContext): void {
   register("htoj.loginByQr", doLoginByQr);
   register("htoj.loginWithToken", doLoginWithToken);
   register("htoj.loginByPassword", doLoginByPassword);
+  register("htoj.loginBySms", doLoginBySms);
 
   register("htoj.logout", async () => {
     await session.logout();
